@@ -29,7 +29,6 @@ import (
 
 	"github.com/go-ini/ini"
 	"github.com/rook/rook/pkg/clusterd"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -42,7 +41,6 @@ func TestCreateDefaultCephConfig(t *testing.T) {
 			"node0": {Name: "mon0", Endpoint: "10.0.0.1:6789"},
 			"node1": {Name: "mon1", Endpoint: "10.0.0.2:6789"},
 		},
-		CephVersion: cephver.Octopus,
 	}
 
 	// start with INFO level logging
@@ -94,13 +92,12 @@ func TestGenerateConfigFile(t *testing.T) {
 		Monitors: map[string]*MonInfo{
 			"node0": {Name: "mon0", Endpoint: "10.0.0.1:6789"},
 		},
-		CephVersion: cephver.Octopus,
-		CephCred:    CephCred{Username: "admin", Secret: "mysecret"},
-		Context:     ctx,
+		CephCred: CephCred{Username: "admin", Secret: "mysecret"},
+		Context:  ctx,
 	}
 
-	isInitialized := clusterInfo.IsInitialized(true)
-	assert.True(t, isInitialized)
+	isInitialized := clusterInfo.IsInitialized()
+	assert.NoError(t, isInitialized)
 
 	// generate the config file to disk now
 	configFilePath, err := generateConfigFile(context, clusterInfo, configDir, filepath.Join(configDir, "mykeyring"), nil, nil)

@@ -35,7 +35,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -84,35 +83,6 @@ func (r *ReconcileClusterDisruption) createDefaultPDBforOSD(namespace string) er
 	selector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{k8sutil.AppAttr: osdPDBAppName},
 	}
-	usePDBV1Beta1, err := k8sutil.UsePDBV1Beta1Version(r.context.ClusterdContext.Clientset)
-	if err != nil {
-		return errors.Wrap(err, "failed to fetch pdb version")
-	}
-	if usePDBV1Beta1 {
-		pdb := &policyv1beta1.PodDisruptionBudget{
-			ObjectMeta: objectMeta,
-			Spec: policyv1beta1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &intstr.IntOrString{IntVal: 1},
-				Selector:       selector,
-			},
-		}
-		ownerInfo := k8sutil.NewOwnerInfo(cephCluster, r.scheme)
-		err := ownerInfo.SetControllerReference(pdb)
-		if err != nil {
-			return errors.Wrapf(err, "failed to set owner reference to pdb %v", pdb)
-		}
-
-		err = r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1beta1.PodDisruptionBudget{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				logger.Info("all PGs are active+clean. Restoring default OSD pdb settings")
-				logger.Infof("creating the default pdb %q with maxUnavailable=1 for all osd", osdPDBAppName)
-				return r.createPDB(pdb)
-			}
-			return errors.Wrapf(err, "failed to get pdb %q", pdb.Name)
-		}
-		return nil
-	}
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: objectMeta,
 		Spec: policyv1.PodDisruptionBudgetSpec{
@@ -121,7 +91,7 @@ func (r *ReconcileClusterDisruption) createDefaultPDBforOSD(namespace string) er
 		},
 	}
 	ownerInfo := k8sutil.NewOwnerInfo(cephCluster, r.scheme)
-	err = ownerInfo.SetControllerReference(pdb)
+	err := ownerInfo.SetControllerReference(pdb)
 	if err != nil {
 		return errors.Wrapf(err, "failed to set owner reference to pdb %v", pdb)
 	}
@@ -144,28 +114,10 @@ func (r *ReconcileClusterDisruption) deleteDefaultPDBforOSD(namespace string) er
 		Name:      osdPDBAppName,
 		Namespace: namespace,
 	}
-	usePDBV1Beta1, err := k8sutil.UsePDBV1Beta1Version(r.context.ClusterdContext.Clientset)
-	if err != nil {
-		return errors.Wrap(err, "failed to fetch pdb version")
-	}
-	if usePDBV1Beta1 {
-		pdb := &policyv1beta1.PodDisruptionBudget{
-			ObjectMeta: objectMeta,
-		}
-		err := r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1beta1.PodDisruptionBudget{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-			return errors.Wrapf(err, "failed to get pdb %q", pdb.Name)
-		}
-		logger.Infof("deleting the default pdb %q with maxUnavailable=1 for all osd", osdPDBAppName)
-		return r.deletePDB(pdb)
-	}
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: objectMeta,
 	}
-	err = r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1.PodDisruptionBudget{})
+	err := r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1.PodDisruptionBudget{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -193,33 +145,6 @@ func (r *ReconcileClusterDisruption) createBlockingPDBForOSD(namespace, failureD
 	selector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{fmt.Sprintf(osd.TopologyLocationLabel, failureDomainType): failureDomainName},
 	}
-	usePDBV1Beta1, err := k8sutil.UsePDBV1Beta1Version(r.context.ClusterdContext.Clientset)
-	if err != nil {
-		return errors.Wrap(err, "failed to fetch pdb version")
-	}
-	if usePDBV1Beta1 {
-		pdb := &policyv1beta1.PodDisruptionBudget{
-			ObjectMeta: objectMeta,
-			Spec: policyv1beta1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &intstr.IntOrString{IntVal: 0},
-				Selector:       selector,
-			},
-		}
-		ownerInfo := k8sutil.NewOwnerInfo(cephCluster, r.scheme)
-		err := ownerInfo.SetControllerReference(pdb)
-		if err != nil {
-			return errors.Wrapf(err, "failed to set owner reference to pdb %v", pdb)
-		}
-		err = r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1beta1.PodDisruptionBudget{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				logger.Infof("creating temporary blocking pdb %q with maxUnavailable=0 for %q failure domain %q", pdbName, failureDomainType, failureDomainName)
-				return r.createPDB(pdb)
-			}
-			return errors.Wrapf(err, "failed to get pdb %q", pdb.Name)
-		}
-		return nil
-	}
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: objectMeta,
 		Spec: policyv1.PodDisruptionBudgetSpec{
@@ -228,7 +153,7 @@ func (r *ReconcileClusterDisruption) createBlockingPDBForOSD(namespace, failureD
 		},
 	}
 	ownerInfo := k8sutil.NewOwnerInfo(cephCluster, r.scheme)
-	err = ownerInfo.SetControllerReference(pdb)
+	err := ownerInfo.SetControllerReference(pdb)
 	if err != nil {
 		return errors.Wrapf(err, "failed to set owner reference to pdb %v", pdb)
 	}
@@ -250,28 +175,10 @@ func (r *ReconcileClusterDisruption) deleteBlockingPDBForOSD(namespace, failureD
 		Name:      pdbName,
 		Namespace: namespace,
 	}
-	usePDBV1Beta1, err := k8sutil.UsePDBV1Beta1Version(r.context.ClusterdContext.Clientset)
-	if err != nil {
-		return errors.Wrap(err, "failed to fetch pdb version")
-	}
-	if usePDBV1Beta1 {
-		pdb := &policyv1beta1.PodDisruptionBudget{
-			ObjectMeta: objectMeta,
-		}
-		err := r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1beta1.PodDisruptionBudget{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-			return errors.Wrapf(err, "failed to get pdb %q", pdb.Name)
-		}
-		logger.Infof("deleting temporary blocking pdb with %q with maxUnavailable=0 for %q failure domain %q", pdbName, failureDomainType, failureDomainName)
-		return r.deletePDB(pdb)
-	}
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: objectMeta,
 	}
-	err = r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1.PodDisruptionBudget{})
+	err := r.client.Get(r.context.OpManagerContext, pdbRequest, &policyv1.PodDisruptionBudget{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -316,6 +223,7 @@ func (r *ReconcileClusterDisruption) reconcilePDBsForOSDs(
 	allFailureDomains,
 	osdDownFailureDomains []string,
 	activeNodeDrains bool,
+	pgHealthyRegex string,
 ) (reconcile.Result, error) {
 	var osdDown bool
 	var drainingFailureDomain string
@@ -324,7 +232,7 @@ func (r *ReconcileClusterDisruption) reconcilePDBsForOSDs(
 		drainingFailureDomain = osdDownFailureDomains[0]
 	}
 
-	pgHealthMsg, pgClean, err := cephclient.IsClusterClean(r.context.ClusterdContext, clusterInfo)
+	pgHealthMsg, pgClean, err := cephclient.IsClusterClean(r.context.ClusterdContext, clusterInfo, pgHealthyRegex)
 	if err != nil {
 		// If the error contains that message, this means the cluster is not up and running
 		// No monitors are present and thus no ceph configuration has been created
@@ -337,24 +245,9 @@ func (r *ReconcileClusterDisruption) reconcilePDBsForOSDs(
 	}
 
 	switch {
-	// osd is down but pgs are active+clean
-	case osdDown && pgClean:
-		lastDrainTimeStamp, err := getLastDrainTimeStamp(pdbStateMap, drainingFailureDomainDurationKey)
-		if err != nil {
-			return reconcile.Result{}, errors.Wrapf(err, "failed to get last drain timestamp from the configmap %q", pdbStateMap.Name)
-		}
-		timeSinceOSDDown := time.Since(lastDrainTimeStamp)
-		if timeSinceOSDDown > 30*time.Second {
-			logger.Infof("osd is down in failure domain %q is down for the last %.2f minutes, but pgs are active+clean", drainingFailureDomain, timeSinceOSDDown.Minutes())
-			resetPDBConfig(pdbStateMap)
-		} else {
-			logger.Infof("osd is down in the failure domain %q, but pgs are active+clean. Requeuing in case pg status is not updated yet...", drainingFailureDomain)
-			return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
-		}
-
-	// osd is down and pgs are not healthy
-	case osdDown && !pgClean:
-		logger.Infof("osd is down in failure domain %q and pgs are not active+clean. pg health: %q", drainingFailureDomain, pgHealthMsg)
+	// osd is down
+	case osdDown:
+		logger.Infof("osd is down in failure domain %q. pg health: %q", drainingFailureDomain, pgHealthMsg)
 		currentlyDrainingFD, ok := pdbStateMap.Data[drainingFailureDomainKey]
 		if !ok || drainingFailureDomain != currentlyDrainingFD {
 			pdbStateMap.Data[drainingFailureDomainKey] = drainingFailureDomain
@@ -382,7 +275,7 @@ func (r *ReconcileClusterDisruption) reconcilePDBsForOSDs(
 		}
 	}
 
-	if pdbStateMap.Data[drainingFailureDomainKey] != "" && !pgClean {
+	if pdbStateMap.Data[drainingFailureDomainKey] != "" {
 		// delete default OSD pdb and create blocking OSD pdbs
 		err := r.handleActiveDrains(allFailureDomains, pdbStateMap.Data[drainingFailureDomainKey], failureDomainType, clusterInfo.Namespace, pgClean)
 		if err != nil {
@@ -400,6 +293,9 @@ func (r *ReconcileClusterDisruption) reconcilePDBsForOSDs(
 
 	err = r.client.Update(clusterInfo.Context, pdbStateMap)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return reconcile.Result{}, nil
+		}
 		return reconcile.Result{}, errors.Wrapf(err, "failed to update configMap %q in cluster %q", pdbStateMapName, request)
 	}
 
@@ -525,9 +421,9 @@ func (r *ReconcileClusterDisruption) getOSDFailureDomains(clusterInfo *cephclien
 		return nil, nil, nil, errors.Wrap(err, "failed to list osd deployments")
 	}
 
-	allFailureDomains := sets.NewString()
-	nodeDrainFailureDomains := sets.NewString()
-	osdDownFailureDomains := sets.NewString()
+	allFailureDomains := sets.New[string]()
+	nodeDrainFailureDomains := sets.New[string]()
+	osdDownFailureDomains := sets.New[string]()
 
 	for _, deployment := range osdDeploymentList.Items {
 		labels := deployment.Spec.Template.ObjectMeta.GetLabels()
@@ -552,7 +448,9 @@ func (r *ReconcileClusterDisruption) getOSDFailureDomains(clusterInfo *cephclien
 					nodeDrainFailureDomains.Insert(failureDomainName)
 				}
 			} else {
-				logger.Infof("osd %q is down but no node drain is detected", deployment.Name)
+				if !strings.HasSuffix(deployment.Name, "-debug") {
+					logger.Infof("osd %q is down but no node drain is detected", deployment.Name)
+				}
 			}
 		}
 
@@ -560,7 +458,7 @@ func (r *ReconcileClusterDisruption) getOSDFailureDomains(clusterInfo *cephclien
 			allFailureDomains.Insert(failureDomainName)
 		}
 	}
-	return allFailureDomains.List(), nodeDrainFailureDomains.List(), osdDownFailureDomains.List(), nil
+	return sets.List(allFailureDomains), sets.List(nodeDrainFailureDomains), sets.List(osdDownFailureDomains), nil
 }
 
 func (r *ReconcileClusterDisruption) hasPGHealthCheckTimedout(pdbStateMap *corev1.ConfigMap) bool {
@@ -590,7 +488,7 @@ func (r *ReconcileClusterDisruption) hasPGHealthCheckTimedout(pdbStateMap *corev
 	return false
 }
 
-// hasNodeDrained returns true if OSD pod is not assigned to any node or if the OSD node is not schedulable
+// hasOSDNodeDrained returns true if OSD pod is not assigned to any node or if the OSD node is not schedulable
 func hasOSDNodeDrained(ctx context.Context, c client.Client, namespace, osdID string) (bool, error) {
 	osdNodeName, err := getOSDNodeName(ctx, c, namespace, osdID)
 	if err != nil {
@@ -640,39 +538,9 @@ func getPDBName(failureDomainType, failureDomainName string) string {
 	return k8sutil.TruncateNodeName(fmt.Sprintf("%s-%s-%s", osdPDBAppName, failureDomainType, "%s"), failureDomainName)
 }
 
-func getLastDrainTimeStamp(pdbStateMap *corev1.ConfigMap, key string) (time.Time, error) {
-	var err error
-	var lastDrainTimeStamp time.Time
-	lastDrainTimeStampString, ok := pdbStateMap.Data[key]
-	if !ok || len(lastDrainTimeStampString) == 0 {
-		return time.Now(), nil
-	} else {
-		lastDrainTimeStamp, err = time.Parse(time.RFC3339, pdbStateMap.Data[key])
-		if err != nil {
-			return time.Time{}, errors.Wrapf(err, "failed to parse timestamp %q", pdbStateMap.Data[key])
-		}
-	}
-
-	return lastDrainTimeStamp, nil
-}
-
 func (r *ReconcileClusterDisruption) getAllowedDisruptions(pdbName, namespace string) (int32, error) {
-	usePDBV1Beta1, err := k8sutil.UsePDBV1Beta1Version(r.context.ClusterdContext.Clientset)
-	if err != nil {
-		return -1, errors.Wrap(err, "failed to fetch pdb version")
-	}
-	if usePDBV1Beta1 {
-		pdb := &policyv1beta1.PodDisruptionBudget{}
-		err = r.client.Get(r.context.OpManagerContext, types.NamespacedName{Name: pdbName, Namespace: namespace}, pdb)
-		if err != nil {
-			return -1, err
-		}
-
-		return pdb.Status.DisruptionsAllowed, nil
-	}
-
 	pdb := &policyv1.PodDisruptionBudget{}
-	err = r.client.Get(r.context.OpManagerContext, types.NamespacedName{Name: pdbName, Namespace: namespace}, pdb)
+	err := r.client.Get(r.context.OpManagerContext, types.NamespacedName{Name: pdbName, Namespace: namespace}, pdb)
 	if err != nil {
 		return -1, err
 	}

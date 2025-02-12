@@ -25,6 +25,7 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	optest "github.com/rook/rook/pkg/operator/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -74,8 +75,17 @@ func TestValidNode(t *testing.T) {
 	t.Run("test valid node", func(t *testing.T) {
 		var placement cephv1.Placement
 		validNodes := GetValidNodes(context.TODO(), storage, clientset, placement)
-		assert.Equal(t, len(validNodes), 1)
+		assert.Equal(t, 1, len(validNodes))
 		assert.Equal(t, "nodeA", validNodes[0].Name)
+	})
+
+	t.Run("test nodes always valid", func(t *testing.T) {
+		var placement cephv1.Placement
+		storage.ScheduleAlways = true
+		validNodes := GetValidNodes(context.TODO(), storage, clientset, placement)
+		require.Equal(t, 2, len(validNodes))
+		assert.Equal(t, "nodeA", validNodes[0].Name)
+		assert.Equal(t, "nodeB", validNodes[1].Name)
 	})
 
 	t.Run("test placement", func(t *testing.T) {
@@ -326,6 +336,22 @@ func TestRookNodesMatchingKubernetesNodes(t *testing.T) {
 	// no k8s nodes specified
 	retNodes = RookNodesMatchingKubernetesNodes(rookStorage, []v1.Node{})
 	assert.Len(t, retNodes, 0)
+
+	// custom node hostname label
+	t.Setenv("ROOK_CUSTOM_HOSTNAME_LABEL", "my_custom_hostname_label")
+	n0.Labels["my_custom_hostname_label"] = "node0-custom-hostname"
+	k8sNodes[0] = n0
+
+	rookStorage.Nodes = []cephv1.Node{
+		{Name: "node0"},
+		{Name: "node1"},
+		{Name: "node2"}}
+	retNodes = RookNodesMatchingKubernetesNodes(rookStorage, k8sNodes)
+	assert.Len(t, retNodes, 3)
+	// this should return nodes named by hostname if that is available
+	assert.Contains(t, retNodes, cephv1.Node{Name: "node0-custom-hostname"})
+	assert.Contains(t, retNodes, cephv1.Node{Name: "node1"})
+	assert.Contains(t, retNodes, cephv1.Node{Name: "node2"})
 }
 
 func TestGenerateNodeAffinity(t *testing.T) {
@@ -381,6 +407,114 @@ func TestGenerateNodeAffinity(t *testing.T) {
 								{
 									Key:      "rook.io/ceph",
 									Operator: v1.NodeSelectorOpExists,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "GenerateNodeAffinityWithJSONInputUsingDoesNotExistOperator",
+			args: args{
+				nodeAffinity: `{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"myKey","operator":"DoesNotExist"}]}]}}`,
+			},
+			want: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchExpressions: []v1.NodeSelectorRequirement{
+								{
+									Key:      "myKey",
+									Operator: v1.NodeSelectorOpDoesNotExist,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "GenerateNodeAffinityWithJSONInputUsingNotInOperator",
+			args: args{
+				nodeAffinity: `{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"myKey","operator":"NotIn","values":["myValue"]}]}]}}`,
+			},
+			want: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchExpressions: []v1.NodeSelectorRequirement{
+								{
+									Key:      "myKey",
+									Operator: v1.NodeSelectorOpNotIn,
+									Values: []string{
+										"myValue",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "GenerateNodeAffinityWithYAMLInputUsingDoesNotExistOperator",
+			args: args{
+				nodeAffinity: `
+---
+requiredDuringSchedulingIgnoredDuringExecution:
+  nodeSelectorTerms:
+    -
+      matchExpressions:
+        -
+          key: myKey
+          operator: DoesNotExist`,
+			},
+			want: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchExpressions: []v1.NodeSelectorRequirement{
+								{
+									Key:      "myKey",
+									Operator: v1.NodeSelectorOpDoesNotExist,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "GenerateNodeAffinityWithYAMLInputUsingNotInOperator",
+			args: args{
+				nodeAffinity: `
+---
+requiredDuringSchedulingIgnoredDuringExecution:
+  nodeSelectorTerms:
+    -
+      matchExpressions:
+        -
+          key: myKey
+          operator: NotIn
+          values:
+            - myValue`,
+			},
+			want: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchExpressions: []v1.NodeSelectorRequirement{
+								{
+									Key:      "myKey",
+									Operator: v1.NodeSelectorOpNotIn,
+									Values: []string{
+										"myValue",
+									},
 								},
 							},
 						},

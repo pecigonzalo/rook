@@ -19,27 +19,28 @@ package object
 
 import (
 	"context"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"net/http"
 	"os"
 	"reflect"
 	"testing"
 	"time"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"github.com/coreos/pkg/capnslog"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	rookfake "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	testopk8s "github.com/rook/rook/pkg/operator/k8sutil/test"
 	"github.com/rook/rook/pkg/operator/test"
 	"github.com/rook/rook/pkg/util/dependents"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -66,9 +67,9 @@ const (
 		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
 		"name": "my-store",
 		"api_name": "my-store",
-		"is_master": "true",
+		"is_master": true,
 		"endpoints": [
-			":80"
+			"http://rook-ceph-rgw-my-store.rook-ceph.svc:80"
 		],
 		"hostnames": [],
 		"hostnames_s3website": [],
@@ -78,7 +79,7 @@ const (
 				"id": "6cb39d2c-3005-49da-9be3-c1a92a97d28a",
 				"name": "my-store",
 				"endpoints": [
-					":80"
+					"http://rook-ceph-rgw-my-store.rook-ceph.svc:80"
 				],
 				"log_meta": "false",
 				"log_data": "false",
@@ -144,9 +145,10 @@ const (
 	dummyVersionsRaw          = `
 	{
 		"mon": {
-			"ceph version 15.2.11 (0000000000000000) octopus (stable)": 3
+			"ceph version 19.2.1 (0000000000000000) squid (stable)": 3
 		}
 	}`
+	//nolint:gosec // only test values, not a real secret
 	userCreateJSON = `{
 	"user_id": "my-user",
 	"display_name": "my-user",
@@ -197,14 +199,50 @@ const (
 		"current_period": "df665ecb-1762-47a9-9c66-f938d251c02a",
 		"epoch": 2
 	}`
-	zoneGroupGetMultisiteJSON = `{
+	zoneGroupGetMultisiteJSONWithoutEndpoint = `{
 		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
 		"name": "zonegroup-a",
 		"api_name": "zonegroup-a",
-		"is_master": "true",
-		"endpoints": [
-			":80"
+		"is_master": true,
+		"endpoints": [],
+		"hostnames": [],
+		"hostnames_s3website": [],
+		"master_zone": "6cb39d2c-3005-49da-9be3-c1a92a97d28a",
+		"zones": [
+			{
+				"id": "6cb39d2c-3005-49da-9be3-c1a92a97d28a",
+				"name": "zone-a",
+				"endpoints": [],
+				"log_meta": "false",
+				"log_data": "false",
+				"bucket_index_max_shards": 0,
+				"read_only": "false",
+				"tier_type": "",
+				"sync_from_all": "true",
+				"sync_from": [],
+				"redirect_zone": ""
+			}
 		],
+		"placement_targets": [
+			{
+				"name": "default-placement",
+				"tags": [],
+				"storage_classes": [
+					"STANDARD"
+				]
+			}
+		],
+		"default_placement": "default-placement",
+		"realm_id": "237e6250-5f7d-4b85-9359-8cb2b1848507"
+	}`
+	zoneGroupGetMultisiteJSONWithEndpoint = `{
+		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
+		"name": "zonegroup-a",
+		"api_name": "zonegroup-a",
+		"is_master": true,
+		"endpoints": [
+			"http://rook-ceph-rgw-my-store.rook-ceph.svc:80"
+        ],
 		"hostnames": [],
 		"hostnames_s3website": [],
 		"master_zone": "6cb39d2c-3005-49da-9be3-c1a92a97d28a",
@@ -213,7 +251,7 @@ const (
 				"id": "6cb39d2c-3005-49da-9be3-c1a92a97d28a",
 				"name": "zone-a",
 				"endpoints": [
-					":80"
+					"http://rook-ceph-rgw-my-store.rook-ceph.svc:80"
 				],
 				"log_meta": "false",
 				"log_data": "false",
@@ -319,9 +357,7 @@ func TestCephObjectStoreController(t *testing.T) {
 			objectStore,
 		}
 
-		for i := range additionalObjects {
-			objects = append(objects, additionalObjects[i])
-		}
+		objects = append(objects, additionalObjects...)
 
 		executor := &exectest.MockExecutor{
 			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
@@ -334,7 +370,7 @@ func TestCephObjectStoreController(t *testing.T) {
 		clientset := test.New(t, 3)
 		c := &clusterd.Context{
 			Executor:      executor,
-			RookClientset: rookclient.NewSimpleClientset(),
+			RookClientset: rookfake.NewSimpleClientset(),
 			Clientset:     clientset,
 		}
 
@@ -347,12 +383,11 @@ func TestCephObjectStoreController(t *testing.T) {
 		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
 		// Create a ReconcileCephObjectStore object with the scheme and fake client.
 		r := &ReconcileCephObjectStore{
-			client:              cl,
-			scheme:              s,
-			context:             c,
-			objectStoreContexts: make(map[string]*objectStoreHealth),
-			recorder:            record.NewFakeRecorder(5),
-			opManagerContext:    context.TODO(),
+			client:           cl,
+			scheme:           s,
+			context:          c,
+			recorder:         record.NewFakeRecorder(5),
+			opManagerContext: context.TODO(),
 		}
 
 		return r
@@ -368,7 +403,7 @@ func TestCephObjectStoreController(t *testing.T) {
 	}
 
 	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
-		return &cephver.Pacific, &cephver.Pacific, nil
+		return &cephver.Reef, &cephver.Reef, nil
 	}
 
 	t.Run("error - no ceph cluster", func(t *testing.T) {
@@ -454,7 +489,7 @@ func TestCephObjectStoreController(t *testing.T) {
 					// ceph actually outputs this all on one line, but this parses the same
 					return `[
 						{"poolnum":1,"poolname":"replicapool"},
-						{"poolnum":2,"poolname":"device_health_metrics"},
+						{"poolnum":2,"poolname":".mgr"},
 						{"poolnum":3,"poolname":".rgw.root"},
 						{"poolnum":4,"poolname":"my-store.rgw.buckets.index"},
 						{"poolnum":5,"poolname":"my-store.rgw.buckets.non-ec"},
@@ -464,6 +499,13 @@ func TestCephObjectStoreController(t *testing.T) {
 						{"poolnum":9,"poolname":"my-store.rgw.buckets.data"}
 					]`, nil
 				}
+				if args[0] == "mirror" && args[2] == "info" {
+					return "{}", nil
+				}
+				if args[0] == "mirror" && args[2] == "disable" {
+					return "", nil
+				}
+
 				return "", nil
 			},
 			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
@@ -490,26 +532,6 @@ func TestCephObjectStoreController(t *testing.T) {
 		return r
 	}
 
-	t.Run("error - failed to start health checker", func(t *testing.T) {
-		r := setupEnvironmentWithReadyCephCluster()
-
-		// cause a failure when creating the admin ops api for the health check
-		origHTTPClientFunc := genObjectStoreHTTPClientFunc
-		genObjectStoreHTTPClientFunc = func(objContext *Context, spec *cephv1.ObjectStoreSpec) (client *http.Client, tlsCert []byte, err error) {
-			return nil, []byte{}, errors.New("induced error creating admin ops API connection")
-		}
-		defer func() { genObjectStoreHTTPClientFunc = origHTTPClientFunc }()
-
-		_, err := r.Reconcile(ctx, req)
-		assert.Error(t, err)
-		// we don't actually care if Requeue is true if there is an error assert.True(t, res.Requeue)
-		assert.Contains(t, err.Error(), "failed to start rgw health checker")
-		assert.Contains(t, err.Error(), "induced error creating admin ops API connection")
-
-		// health checker should start up after committing config changes
-		assert.True(t, calledCommitConfigChanges)
-	})
-
 	t.Run("success - object store is running", func(t *testing.T) {
 		r := setupEnvironmentWithReadyCephCluster()
 
@@ -520,11 +542,11 @@ func TestCephObjectStoreController(t *testing.T) {
 		objectStore := &cephv1.CephObjectStore{}
 		err = r.client.Get(context.TODO(), req.NamespacedName, objectStore)
 		assert.NoError(t, err)
-		assert.Equal(t, cephv1.ConditionProgressing, objectStore.Status.Phase, objectStore)
+		assert.Equal(t, cephv1.ConditionReady, objectStore.Status.Phase, objectStore)
 		assert.NotEmpty(t, objectStore.Status.Info["endpoint"], objectStore)
 		assert.Equal(t, "http://rook-ceph-rgw-my-store.rook-ceph.svc:80", objectStore.Status.Info["endpoint"], objectStore)
 		assert.True(t, calledCommitConfigChanges)
-		assert.Equal(t, 16, r.clusterInfo.CephVersion.Major)
+		assert.Equal(t, 18, r.clusterInfo.CephVersion.Major)
 	})
 }
 
@@ -532,6 +554,9 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 	ctx := context.TODO()
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
+	var deploymentsUpdated *[]*apps.Deployment
+	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
 
 	zoneName := "zone-a"
 	zoneGroupName := "zonegroup-a"
@@ -619,7 +644,7 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 
 	objectStore.Spec.Zone.Name = zoneName
 	objectStore.Spec.Gateway.Port = 80
-
+	zoneGroupGetMultisiteJSON := zoneGroupGetMultisiteJSONWithoutEndpoint
 	object := []runtime.Object{
 		objectZone,
 		objectStore,
@@ -651,8 +676,13 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 			if args[0] == "realm" && args[1] == "get" {
 				return realmGetMultisiteJSON, nil
 			}
-			if args[0] == "zonegroup" && args[1] == "get" {
-				return zoneGroupGetMultisiteJSON, nil
+			if args[0] == "zonegroup" {
+				if args[1] == "get" {
+					return zoneGroupGetMultisiteJSON, nil
+				} else if args[1] == "modify" {
+					zoneGroupGetMultisiteJSON = zoneGroupGetMultisiteJSONWithEndpoint
+					return zoneGroupGetMultisiteJSON, nil
+				}
 			}
 			if args[0] == "zone" && args[1] == "get" {
 				return zoneGetMultisiteJSON, nil
@@ -676,9 +706,14 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 
 	clientset := test.New(t, 3)
 	c := &clusterd.Context{
-		Executor:      executor,
-		RookClientset: rookclient.NewSimpleClientset(),
-		Clientset:     clientset,
+		Executor: executor,
+		RookClientset: rookfake.NewSimpleClientset(
+			objectRealm,
+			objectZoneGroup,
+			objectZone,
+			objectStore,
+		),
+		Clientset: clientset,
 	}
 
 	// Register operator types with the runtime scheme.
@@ -689,12 +724,11 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 	r := &ReconcileCephObjectStore{
-		client:              cl,
-		scheme:              s,
-		context:             c,
-		objectStoreContexts: make(map[string]*objectStoreHealth),
-		recorder:            record.NewFakeRecorder(5),
-		opManagerContext:    ctx,
+		client:           cl,
+		scheme:           s,
+		context:          c,
+		recorder:         record.NewFakeRecorder(5),
+		opManagerContext: ctx,
 	}
 
 	_, err := r.context.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
@@ -708,7 +742,7 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 	}
 
 	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
-		return &cephver.Pacific, &cephver.Pacific, nil
+		return &cephver.Reef, &cephver.Reef, nil
 	}
 
 	t.Run("create an object store", func(t *testing.T) {
@@ -719,7 +753,6 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 		err = r.client.Get(ctx, req.NamespacedName, objectStore)
 		assert.NoError(t, err)
 	})
-
 	t.Run("delete the same store", func(t *testing.T) {
 		calledCommitConfigChanges = false
 
@@ -737,7 +770,15 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 		objectStore.DeletionTimestamp = &metav1.Time{
 			Time: time.Now(),
 		}
-		err = r.client.Update(ctx, objectStore)
+		objectStore.Finalizers = []string{"cephobjectstore.ceph.rook.io"}
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		r := &ReconcileCephObjectStore{
+			client:           cl,
+			scheme:           s,
+			context:          c,
+			recorder:         record.NewFakeRecorder(5),
+			opManagerContext: ctx,
+		}
 
 		// have to also track the same objects in the rook clientset
 		r.context.RookClientset = rookfake.NewSimpleClientset(
@@ -799,7 +840,7 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 	}
 
 	externalObjectStore.Spec.Gateway.Port = 81
-	externalObjectStore.Spec.Gateway.ExternalRgwEndpoints = []v1.EndpointAddress{{IP: ""}}
+	externalObjectStore.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{{IP: ""}}
 
 	rgwAdminOpsUserSecret := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -843,18 +884,17 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 
 		c := &clusterd.Context{
 			Executor:      executor,
-			RookClientset: rookclient.NewSimpleClientset(),
+			RookClientset: rookfake.NewSimpleClientset(),
 			Clientset:     clientset,
 			Client:        cl,
 		}
 
 		r := &ReconcileCephObjectStore{
-			client:              cl,
-			scheme:              s,
-			context:             c,
-			objectStoreContexts: make(map[string]*objectStoreHealth),
-			recorder:            record.NewFakeRecorder(5),
-			opManagerContext:    ctx,
+			client:           cl,
+			scheme:           s,
+			context:          c,
+			recorder:         record.NewFakeRecorder(5),
+			opManagerContext: ctx,
 		}
 
 		_, err := r.context.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
@@ -874,7 +914,7 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 	}
 
 	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
-		return &cephver.Pacific, &cephver.Pacific, nil
+		return &cephver.Reef, &cephver.Reef, nil
 	}
 
 	{
@@ -907,8 +947,8 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 			externalObjectStore.DeletionTimestamp = &metav1.Time{
 				Time: time.Now(),
 			}
-			err = r.client.Update(ctx, externalObjectStore)
-			assert.NoError(t, err)
+			externalObjectStore.Finalizers = []string{"cephobjectstore.ceph.rook.io"}
+			r := getReconciler(objects)
 
 			// have to also track the same objects in the rook clientset
 			r.context.RookClientset = rookfake.NewSimpleClientset(externalObjectStore)
@@ -955,22 +995,22 @@ func TestDiffVersions(t *testing.T) {
 			if args[0] == "versions" {
 				return `{
     "mon": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 3
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 3
     },
     "mgr": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 1
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 1
     },
     "osd": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 3
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 3
     },
     "mds": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 2
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 2
     },
     "rgw": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 1
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 1
     },
     "overall": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 10
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 10
     }
 }`, nil
 			}
@@ -980,7 +1020,7 @@ func TestDiffVersions(t *testing.T) {
 	c := &clusterd.Context{Executor: executor}
 
 	// desiredCephVersion comes from DetectCephVersion() (ceph --version) which uses ExtractCephVersion()
-	desiredCephVersion, err := cephver.ExtractCephVersion("ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)")
+	desiredCephVersion, err := cephver.ExtractCephVersion("ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)")
 	assert.NoError(t, err)
 
 	// runningCephVersion comes from LeastUptodateDaemonVersion()

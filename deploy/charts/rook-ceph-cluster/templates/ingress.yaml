@@ -4,6 +4,7 @@ apiVersion: {{ include "capabilities.ingress.apiVersion" . }}
 kind: Ingress
 metadata:
   name: {{ template "clusterName" . }}-dashboard
+  namespace: {{ .Release.Namespace }} # namespace:cluster
   {{- if .Values.ingress.dashboard.annotations }}
   annotations: {{- toYaml .Values.ingress.dashboard.annotations | nindent 4 }}
   {{- end }}
@@ -32,6 +33,9 @@ spec:
               servicePort: http-dashboard
               {{- end }}
 {{- end }}
+  {{- if .Values.ingress.dashboard.ingressClassName }}
+  ingressClassName: {{ .Values.ingress.dashboard.ingressClassName }}
+  {{- end }}
   {{- if .Values.ingress.dashboard.tls }}
   tls: {{- toYaml .Values.ingress.dashboard.tls | nindent 4 }}
   {{- end }}

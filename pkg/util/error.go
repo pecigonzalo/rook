@@ -26,11 +26,12 @@ import (
 // the text "errors:". All errors in the list will lose any context besides their error string.
 // If the errs list is empty, AggregateErrors returns nil.
 // Example:
-//    AggregateErrors(errList, "errors for my %q", "mom")  -->
-//    `errors for my "mom":
-//        error 1
-//        error 2
-//        etc.`
+//
+//	AggregateErrors(errList, "errors for my %q", "mom")  -->
+//	`errors for my "mom":
+//	    error 1
+//	    error 2
+//	    etc.`
 func AggregateErrors(errs []error, format string, args ...interface{}) error {
 	if len(errs) == 0 {
 		return nil
@@ -40,5 +41,5 @@ func AggregateErrors(errs []error, format string, args ...interface{}) error {
 	for _, err := range errs {
 		errString = fmt.Sprintf("%s\n    %s", errString, err.Error())
 	}
-	return errors.Errorf(errString)
+	return errors.Errorf("%s", errString)
 }

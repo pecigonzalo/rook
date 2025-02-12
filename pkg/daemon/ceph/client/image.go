@@ -31,18 +31,33 @@ import (
 )
 
 const (
-	ImageMinSize = uint64(1048576) // 1 MB
+	MiB          = uint64(1048576) // 1 MiB
+	ImageMinSize = MiB
 )
 
 type CephBlockImage struct {
+	ID       string `json:"id"`
 	Name     string `json:"image"`
 	Size     uint64 `json:"size"`
 	Format   int    `json:"format"`
 	InfoName string `json:"name"`
 }
 
-func ListImages(context *clusterd.Context, clusterInfo *ClusterInfo, poolName string) ([]CephBlockImage, error) {
+type CephBlockImageSnapshot struct {
+	Name string `json:"name"`
+}
+
+// ListImagesInPool returns a list of images created in a cephblockpool
+func ListImagesInPool(context *clusterd.Context, clusterInfo *ClusterInfo, poolName string) ([]CephBlockImage, error) {
+	return ListImagesInRadosNamespace(context, clusterInfo, poolName, "")
+}
+
+// ListImagesInRadosNamespace returns a list if images created in a cephblockpool rados namespace
+func ListImagesInRadosNamespace(context *clusterd.Context, clusterInfo *ClusterInfo, poolName, namespace string) ([]CephBlockImage, error) {
 	args := []string{"ls", "-l", poolName}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
 	cmd := NewRBDCommand(context, clusterInfo, args)
 	cmd.JsonOutput = true
 	buf, err := cmd.Run()
@@ -68,6 +83,72 @@ func ListImages(context *clusterd.Context, clusterInfo *ClusterInfo, poolName st
 	return images, nil
 }
 
+// ListSnapshotsInRadosNamespace lists all the snapshots created for an image in a cephblockpool in a given rados namespace
+func ListSnapshotsInRadosNamespace(context *clusterd.Context, clusterInfo *ClusterInfo, poolName, imageName, namespace string) ([]CephBlockImageSnapshot, error) {
+	snapshots := []CephBlockImageSnapshot{}
+	args := []string{"snap", "ls", getImageSpec(imageName, poolName)}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	cmd := NewRBDCommand(context, clusterInfo, args)
+	cmd.JsonOutput = true
+	buf, err := cmd.Run()
+	if err != nil {
+		return snapshots, errors.Wrapf(err, "failed to list snapshots of image %q in cephblockpool %q", imageName, poolName)
+	}
+
+	if err = json.Unmarshal(buf, &snapshots); err != nil {
+		return snapshots, errors.Wrapf(err, "unmarshal failed, raw buffer response: %s", string(buf))
+	}
+	return snapshots, nil
+}
+
+// DeleteSnapshotInRadosNamespace deletes a image snapshot created in block pool in a given rados namespace
+func DeleteSnapshotInRadosNamespace(context *clusterd.Context, clusterInfo *ClusterInfo, poolName, imageName, snapshot, namespace string) error {
+	args := []string{"snap", "rm", getImageSnapshotSpec(poolName, imageName, snapshot)}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	cmd := NewRBDCommand(context, clusterInfo, args)
+	_, err := cmd.Run()
+	if err != nil {
+		return errors.Wrapf(err, "failed to delete snapshot %q of image %q in cephblockpool %q", snapshot, imageName, poolName)
+	}
+	return nil
+}
+
+// MoveImageToTrashInRadosNamespace moves the cephblockpool image to trash in the rados namespace
+func MoveImageToTrashInRadosNamespace(context *clusterd.Context, clusterInfo *ClusterInfo, poolName, imageName, namespace string) error {
+	args := []string{"trash", "mv", getImageSpec(imageName, poolName)}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+	cmd := NewRBDCommand(context, clusterInfo, args)
+	_, err := cmd.Run()
+	if err != nil {
+		return errors.Wrapf(err, "failed to move image %q in cephblockpool %q to trash", imageName, poolName)
+	}
+	return nil
+}
+
+// DeleteImageFromTrashInRadosNamespace deletes the image from trash in the rados namespace
+func DeleteImageFromTrashInRadosNamespace(context *clusterd.Context, clusterInfo *ClusterInfo, poolName, imageID, namespace string) error {
+	args := []string{"rbd", "task", "add", "trash", "remove", getImageSpecInRadosNamespace(poolName, namespace, imageID)}
+	cmd := NewCephCommand(context, clusterInfo, args)
+	_, err := cmd.Run()
+	if err != nil {
+		return errors.Wrapf(err, "failed to delete image %q in cephblockpool %q from trash", imageID, poolName)
+	}
+	return nil
+}
+
+// for a given size in bytes, round up to the nearest number of Mibibytes,
+// i. e. return the smallest  number of Mibibytes larger than or equal to size.
+func roundupSizeMiB(size uint64) uint64 {
+	sizeMiB := (size + MiB - 1) / MiB
+	return sizeMiB
+}
+
 // CreateImage creates a block storage image.
 // If dataPoolName is not empty, the image will use poolName as the metadata pool and the dataPoolname for data.
 // If size is zero an empty image will be created. Otherwise, an image will be
@@ -81,13 +162,13 @@ func CreateImage(context *clusterd.Context, clusterInfo *ClusterInfo, name, pool
 		size = ImageMinSize
 	}
 
-	// Roundup the size of the volume image since we only create images on 1MB bundaries and we should never create an image
+	// Roundup the size of the volume image since we only create images on 1MB boundaries and we should never create an image
 	// size that's smaller than the requested one, e.g, requested 1048698 bytes should be 2MB while not be truncated to 1MB
-	sizeMB := int((size + ImageMinSize - 1) / ImageMinSize)
+	sizeMB := roundupSizeMiB(size)
 
 	imageSpec := getImageSpec(name, poolName)
 
-	args := []string{"create", imageSpec, "--size", strconv.Itoa(sizeMB)}
+	args := []string{"create", imageSpec, "--size", fmt.Sprintf("%d", sizeMB)}
 
 	if dataPoolName != "" {
 		args = append(args, fmt.Sprintf("--data-pool=%s", dataPoolName))
@@ -116,16 +197,22 @@ func CreateImage(context *clusterd.Context, clusterInfo *ClusterInfo, name, pool
 	return &CephBlockImage{Name: name, Size: newSizeBytes}, nil
 }
 
-func DeleteImage(context *clusterd.Context, clusterInfo *ClusterInfo, name, poolName string) error {
+func DeleteImageInPool(context *clusterd.Context, clusterInfo *ClusterInfo, name, poolName string) error {
+	return DeleteImageInRadosNamespace(context, clusterInfo, name, poolName, "")
+}
+
+func DeleteImageInRadosNamespace(context *clusterd.Context, clusterInfo *ClusterInfo, name, poolName, namespace string) error {
 	logger.Infof("deleting rbd image %q from pool %q", name, poolName)
 	imageSpec := getImageSpec(name, poolName)
 	args := []string{"rm", imageSpec}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
 	buf, err := NewRBDCommand(context, clusterInfo, args).Run()
 	if err != nil {
 		return errors.Wrapf(err, "failed to delete image %s in pool %s, output: %s",
 			name, poolName, string(buf))
 	}
-
 	return nil
 }
 
@@ -195,4 +282,15 @@ func UnMapImage(context *clusterd.Context, clusterInfo *ClusterInfo, imageName, 
 
 func getImageSpec(name, poolName string) string {
 	return fmt.Sprintf("%s/%s", poolName, name)
+}
+
+func getImageSpecInRadosNamespace(poolName, namespace, imageID string) string {
+	if namespace == "" {
+		return fmt.Sprintf("%s/%s", poolName, imageID)
+	}
+	return fmt.Sprintf("%s/%s/%s", poolName, namespace, imageID)
+}
+
+func getImageSnapshotSpec(poolName, imageName, snapshot string) string {
+	return fmt.Sprintf("%s/%s@%s", poolName, imageName, snapshot)
 }

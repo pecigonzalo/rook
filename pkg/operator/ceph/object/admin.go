@@ -38,15 +38,22 @@ import (
 
 // Context holds the context for the object store.
 type Context struct {
-	Context         *clusterd.Context
-	clusterInfo     *cephclient.ClusterInfo
-	CephClusterSpec cephv1.ClusterSpec
-	Name            string
-	UID             string
-	Endpoint        string
-	Realm           string
-	ZoneGroup       string
-	Zone            string
+	Context     *clusterd.Context
+	clusterInfo *cephclient.ClusterInfo
+	Name        string
+	UID         string
+	Endpoint    string
+	Realm       string
+	ZoneGroup   string
+	Zone        string
+}
+
+func (c *Context) nsName() string {
+	if c.clusterInfo == nil {
+		logger.Infof("unable to get namespaced name for rgw %s", c.Name)
+		return c.Name
+	}
+	return fmt.Sprintf("%s/%s", c.clusterInfo.Namespace, c.Name)
 }
 
 // AdminOpsContext holds the object store context as well as information for connecting to the admin
@@ -102,9 +109,7 @@ const (
 	rgwAdminOpsUserCaps       = "buckets=*;users=*;usage=read;metadata=read;zone=read"
 )
 
-var (
-	rgwAdminOpsUserDisplayName = "RGW Admin Ops User"
-)
+var rgwAdminOpsUserDisplayName = "RGW Admin Ops User"
 
 // NewContext creates a new object store context.
 func NewContext(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo, name string) *Context {
@@ -117,7 +122,7 @@ func NewMultisiteContext(context *clusterd.Context, clusterInfo *cephclient.Clus
 	objContext := NewContext(context, clusterInfo, store.Name)
 	objContext.UID = string(store.UID)
 
-	if err := UpdateEndpoint(objContext, &store.Spec); err != nil {
+	if err := UpdateEndpointForAdminOps(objContext, store); err != nil {
 		return nil, err
 	}
 
@@ -132,16 +137,26 @@ func NewMultisiteContext(context *clusterd.Context, clusterInfo *cephclient.Clus
 	return objContext, nil
 }
 
-// UpdateEndpoint updates an object.Context using the latest info from the CephObjectStore spec
-func UpdateEndpoint(objContext *Context, spec *cephv1.ObjectStoreSpec) error {
-	nsName := fmt.Sprintf("%s/%s", objContext.clusterInfo.Namespace, objContext.Name)
+// GetAdminOpsEndpoint returns an endpoint that can be used to perform RGW admin ops
+func GetAdminOpsEndpoint(s *cephv1.CephObjectStore) (string, error) {
+	nsName := fmt.Sprintf("%s/%s", s.Namespace, s.Name)
 
-	port, err := spec.GetPort()
+	// advertise endpoint should be most likely to have a valid cert, so use it for admin ops
+	endpoint, err := s.GetAdvertiseEndpointUrl()
 	if err != nil {
-		return errors.Wrapf(err, "failed to get port for object store %q", nsName)
+		return "", errors.Wrapf(err, "failed to get advertise endpoint for object store %q", nsName)
 	}
-	objContext.Endpoint = BuildDNSEndpoint(BuildDomainName(objContext.Name, objContext.clusterInfo.Namespace), port, spec.IsTLSEnabled())
+	return endpoint, nil
+}
 
+// UpdateEndpointForAdminOps updates the object.Context endpoint with the latest admin ops endpoint
+// for the CephObjectStore.
+func UpdateEndpointForAdminOps(objContext *Context, store *cephv1.CephObjectStore) error {
+	endpoint, err := GetAdminOpsEndpoint(store)
+	if err != nil {
+		return err
+	}
+	objContext.Endpoint = endpoint
 	return nil
 }
 
@@ -214,7 +229,7 @@ func RunAdminCommandNoMultisite(c *Context, expectJSON bool, args ...string) (st
 	var err error
 
 	// If Multus is enabled we proxy all the command to the mgr sidecar
-	if c.CephClusterSpec.Network.IsMultus() {
+	if c.clusterInfo.NetworkSpec.IsMultus() {
 		output, stderr, err = c.Context.RemoteExecutor.ExecCommandInContainerWithFullOutputWithTimeout(c.clusterInfo.Context, cephclient.ProxyAppLabel, cephclient.CommandProxyInitContainerName, c.clusterInfo.Namespace, append([]string{"radosgw-admin"}, args...)...)
 	} else {
 		command, args := cephclient.FinalizeCephCommandArgs("radosgw-admin", c.clusterInfo, args, c.Context.ConfigDir)
@@ -250,7 +265,6 @@ func runAdminCommand(c *Context, expectJSON bool, args ...string) (string, error
 			fmt.Sprintf("--rgw-zonegroup=%s", c.ZoneGroup),
 			fmt.Sprintf("--rgw-zone=%s", c.Zone),
 		}
-
 		args = append(args, options...)
 	}
 
@@ -304,7 +318,7 @@ func CommitConfigChanges(c *Context) error {
 		return errorOrIsNotFound(err, "failed to get the current RGW configuration period to see if it needs changed")
 	}
 
-	// this stages the current config changees and returns what the new period config will look like
+	// this stages the current config changes and returns what the new period config will look like
 	// without committing the changes
 	stagedPeriod, err := runAdminCommand(c, true, "period", "update")
 	if err != nil {
@@ -381,20 +395,18 @@ func periodWillChange(current, staged string) (bool, error) {
 	// different in the staged period, even when no updates are needed. Sometimes, the values are
 	// reported as different in the staging output but aren't actually changed upon commit.
 	ignorePaths := cmp.FilterPath(func(path cmp.Path) bool {
-		// path.String() outputs nothing for the crude map[string]interface{} JSON struct
-		// Example of path.GoString() output for a long path in the period JSON:
-		// root["period_map"].(map[string]interface {})["short_zone_ids"].([]interface {})[0].(map[string]interface {})["val"].(float64)
-		switch path.GoString() {
-		case `root["id"]`:
-			// "id" is always changed in the staged period, but it doesn't always update.
+		j := toJsonPath(path)
+		switch j {
+		case ".id": // {"epoch"}
+			// "id" always changes in staged period, but not always when committed
 			return true
-		case `root["predecessor_uuid"]`:
-			// "predecessor_uuid" is always changed in the staged period, but it doesn't always update.
+		case ".predecessor_uuid":
+			// "predecessor_uuid" always changes in staged period, but not always when committed
 			return true
-		case `root["realm_epoch"]`:
-			// "realm_epoch" is always incremented in the staged period, but it doesn't always increment.
+		case ".realm_epoch":
+			// "realm_epoch" always increments in staged period, but not always when committed
 			return true
-		case `root["epoch"]`:
+		case ".epoch":
 			// Strangely, "epoch" is not incremented in the staged period even though it is always
 			// incremented upon an actual commit. It could be argued that this behavior is a bug.
 			// Ignore this value to handle the possibility that the behavior changes in the future.
@@ -409,6 +421,22 @@ func periodWillChange(current, staged string) (bool, error) {
 	logger.Debugf("RGW config period diff:\n%s", diff)
 
 	return (diff != ""), nil
+}
+
+// convert a cmp.Path to a path in json format like might be used with jq to query the item
+// e.g., {"a": {"b": "c"}} returns .a.b
+func toJsonPath(path cmp.Path) string {
+	out := ""
+	for _, step := range path {
+		mi, ok := step.(cmp.MapIndex)
+		if !ok {
+			// because we use a dumb map[string]interface{}, we only need to process map indexes,
+			// but the path has other node types because of how the json gets processed
+			continue
+		}
+		out = out + "." + mi.Key().String()
+	}
+	return out
 }
 
 func GetAdminOPSUserCredentials(objContext *Context, spec *cephv1.ObjectStoreSpec) (string, string, error) {
@@ -441,7 +469,7 @@ func GetAdminOPSUserCredentials(objContext *Context, spec *cephv1.ObjectStoreSpe
 		DisplayName:  &rgwAdminOpsUserDisplayName,
 		AdminOpsUser: true,
 	}
-	logger.Debugf("creating s3 user object %q for object store %q", userConfig.UserID, ns)
+	logger.Debugf("creating s3 user object %q for object store %q", userConfig.UserID, objContext.Name)
 
 	forceUserCreation := false
 	// If the cluster where we are running the rgw user create for the admin ops user is configured

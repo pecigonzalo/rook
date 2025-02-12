@@ -26,19 +26,30 @@ import (
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
+	"github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/operator/test"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
+	apifake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func TestCephCSIController(t *testing.T) {
+	oldReconcileSaveCSIDriverOptions := reconcileSaveCSIDriverOptions
+	defer func() { reconcileSaveCSIDriverOptions = oldReconcileSaveCSIDriverOptions }()
+	saveCSIDriverOptionsCalledForClusterNS := []string{}
+	reconcileSaveCSIDriverOptions = func(clientset kubernetes.Interface, clusterNamespace string, clusterInfo *client.ClusterInfo) error {
+		saveCSIDriverOptionsCalledForClusterNS = append(saveCSIDriverOptionsCalledForClusterNS, clusterNamespace)
+		return nil
+	}
+
 	ctx := context.TODO()
 	var (
 		name      = "rook-ceph"
@@ -47,10 +58,9 @@ func TestCephCSIController(t *testing.T) {
 	// Set DEBUG logging
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
-	os.Setenv(k8sutil.PodNameEnvVar, "rook-ceph-operator")
-	os.Setenv(k8sutil.PodNamespaceEnvVar, namespace)
+	t.Setenv(k8sutil.PodNameEnvVar, "rook-ceph-operator")
+	t.Setenv(k8sutil.PodNamespaceEnvVar, namespace)
 
-	os.Setenv("ROOK_CSI_ALLOW_UNSUPPORTED_VERSION", "true")
 	CSIParam = Param{
 		CSIPluginImage:   "image",
 		RegistrarImage:   "image",
@@ -105,8 +115,9 @@ func TestCephCSIController(t *testing.T) {
 		fakeClientSet := test.New(t, 1)
 		test.SetFakeKubernetesVersion(fakeClientSet, "v1.21.0")
 		c := &clusterd.Context{
-			Clientset:     fakeClientSet,
-			RookClientset: rookclient.NewSimpleClientset(),
+			Clientset:           fakeClientSet,
+			RookClientset:       rookclient.NewSimpleClientset(),
+			ApiExtensionsClient: apifake.NewSimpleClientset(),
 		}
 		_, err := c.Clientset.CoreV1().Pods(namespace).Create(ctx, test.FakeOperatorPod(namespace), metav1.CreateOptions{})
 		assert.NoError(t, err)
@@ -127,8 +138,25 @@ func TestCephCSIController(t *testing.T) {
 				},
 			},
 		}
+		// Mock clusterInfo
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err = c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
 		s := scheme.Scheme
-		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{})
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{}, &v1.ConfigMap{})
+		saveCSIDriverOptionsCalledForClusterNS = []string{}
 
 		object := []runtime.Object{
 			cephCluster,
@@ -154,5 +182,92 @@ func TestCephCSIController(t *testing.T) {
 		ds, err := c.Clientset.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(ds.Items), ds)
+
+		assert.Equal(t, []string{namespace}, saveCSIDriverOptionsCalledForClusterNS)
+	})
+
+	t.Run("success ceph csi deployment with multus", func(t *testing.T) {
+		fakeClientSet := test.New(t, 1)
+		test.SetFakeKubernetesVersion(fakeClientSet, "v1.21.0")
+		c := &clusterd.Context{
+			Clientset:           fakeClientSet,
+			RookClientset:       rookclient.NewSimpleClientset(),
+			ApiExtensionsClient: apifake.NewSimpleClientset(),
+		}
+		_, err := c.Clientset.CoreV1().Pods(namespace).Create(ctx, test.FakeOperatorPod(namespace), metav1.CreateOptions{})
+		assert.NoError(t, err)
+		_, err = c.Clientset.AppsV1().ReplicaSets(namespace).Create(context.TODO(), test.FakeReplicaSet(namespace), metav1.CreateOptions{})
+		assert.NoError(t, err)
+		cephCluster := &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      namespace,
+				Namespace: namespace,
+			},
+			Spec: cephv1.ClusterSpec{
+				Network: cephv1.NetworkSpec{
+					Provider:  cephv1.NetworkProviderMultus,
+					Selectors: map[cephv1.CephNetworkType]string{"public": "public-net", "cluster": "cluster-net"},
+				},
+			},
+			Status: cephv1.ClusterStatus{
+				Phase: "",
+				CephVersion: &cephv1.ClusterVersion{
+					Version: "14.2.9-0",
+				},
+				CephStatus: &cephv1.CephStatus{
+					FSID: "89d00089-d6e6-4445-b596-96898ce31793",
+				},
+			},
+		}
+		// Mock clusterInfo
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err = c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
+		s := scheme.Scheme
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{}, &v1.ConfigMap{})
+		saveCSIDriverOptionsCalledForClusterNS = []string{}
+
+		object := []runtime.Object{
+			cephCluster,
+		}
+		// Create a fake client to mock API calls.
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		c.Client = cl
+		// Create a ReconcileCSI object with the scheme and fake client.
+		r := &ReconcileCSI{
+			scheme:  s,
+			client:  cl,
+			context: c,
+			opConfig: controller.OperatorConfig{
+				OperatorNamespace: namespace,
+				Image:             "rook",
+				ServiceAccount:    "foo",
+			},
+		}
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+
+		ds, err := c.Clientset.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, 2, len(ds.Items), ds)
+		assert.Equal(t, "csi-cephfsplugin", ds.Items[0].Name)
+		assert.Equal(t, "csi-rbdplugin", ds.Items[1].Name)
+		assert.Equal(t, ``, ds.Items[1].Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"], ds.Items[1].Spec.Template.Annotations)
+
+		assert.Equal(t, []string{namespace}, saveCSIDriverOptionsCalledForClusterNS)
 	})
 }

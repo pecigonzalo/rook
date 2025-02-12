@@ -21,18 +21,22 @@ import (
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 )
 
 // validatePool Validate the pool arguments
-func validatePool(context *clusterd.Context, clusterInfo *client.ClusterInfo, clusterSpec *cephv1.ClusterSpec, p *cephv1.CephBlockPool) error {
+func validatePool(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo, clusterSpec *cephv1.ClusterSpec, p *cephv1.CephBlockPool) error {
 	if p.Name == "" {
 		return errors.New("missing name")
 	}
 	if p.Namespace == "" {
 		return errors.New("missing namespace")
 	}
+
+	if err := cephv1.ValidateCephBlockPool(p); err != nil {
+		return err
+	}
+
 	if err := ValidatePoolSpec(context, clusterInfo, clusterSpec, &p.Spec.PoolSpec); err != nil {
 		return err
 	}
@@ -71,10 +75,10 @@ func ValidatePoolSpec(context *clusterd.Context, clusterInfo *cephclient.Cluster
 		}
 	}
 
-	var crush client.CrushMap
+	var crush cephclient.CrushMap
 	var err error
 	if p.FailureDomain != "" || p.CrushRoot != "" {
-		crush, err = client.GetCrushMap(context, clusterInfo)
+		crush, err = cephclient.GetCrushMap(context, clusterInfo)
 		if err != nil {
 			return errors.Wrap(err, "failed to get crush map")
 		}
@@ -144,7 +148,7 @@ func ValidatePoolSpec(context *clusterd.Context, clusterInfo *cephclient.Cluster
 
 	// Test the same for Parameters
 	if p.Parameters != nil {
-		compression, ok := p.Parameters[client.CompressionModeProperty]
+		compression, ok := p.Parameters[cephclient.CompressionModeProperty]
 		if ok && compression != "" {
 			switch compression {
 			case "none", "passive", "aggressive", "force":

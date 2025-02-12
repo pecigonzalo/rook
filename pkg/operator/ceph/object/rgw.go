@@ -19,8 +19,8 @@ package object
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -33,6 +33,7 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/pool"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/exec"
@@ -60,6 +61,10 @@ type rgwConfig struct {
 	Realm        string
 	ZoneGroup    string
 	Zone         string
+
+	Auth           cephv1.AuthSpec
+	KeystoneSecret *v1.Secret
+	Protocols      cephv1.ProtocolSpec
 }
 
 var updateDeploymentAndWait = mon.UpdateCephDeploymentAndWait
@@ -68,24 +73,32 @@ var (
 	insecureSkipVerify = "insecureSkipVerify"
 )
 
-func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName string) error {
+func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName string, keystoneSecret *v1.Secret) error {
 	logger.Infof("creating object store %q in namespace %q", c.store.Name, c.store.Namespace)
 
-	if err := c.startRGWPods(realmName, zoneGroupName, zoneName); err != nil {
+	if err := c.startRGWPods(realmName, zoneGroupName, zoneName, keystoneSecret); err != nil {
 		return errors.Wrap(err, "failed to start rgw pods")
 	}
 
-	objContext := NewContext(c.context, c.clusterInfo, c.store.Namespace)
-	err := enableRGWDashboard(objContext)
+	objContext, err := NewMultisiteContext(c.context, c.clusterInfo, c.store)
 	if err != nil {
-		logger.Warningf("failed to enable dashboard for rgw. %v", err)
+		logger.Warningf("failed to get object context for rgw %q. %v", c.store.Name, err)
+		return nil
+	}
+
+	if c.clusterSpec.Dashboard.Enabled {
+		if !c.store.Spec.IsRGWDashboardEnabled() {
+			disableRGWDashboard(objContext)
+		} else if err = enableRGWDashboard(objContext); err != nil {
+			logger.Warningf("failed to enable dashboard for rgw. %v", err)
+		}
 	}
 
 	logger.Infof("created object store %q in namespace %q", c.store.Name, c.store.Namespace)
 	return nil
 }
 
-func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) error {
+func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string, keystoneSecret *v1.Secret) error {
 	// backward compatibility, triggered during updates
 	if c.store.Spec.Gateway.Instances < 1 {
 		// Set the minimum of at least one instance
@@ -93,27 +106,38 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		c.store.Spec.Gateway.Instances = 1
 	}
 
-	// start a new deployment and scale up
-	desiredRgwInstances := int(c.store.Spec.Gateway.Instances)
-	// If running on Pacific we force a single deployment and later set the deployment replica to the "instances" value
-	if c.clusterInfo.CephVersion.IsAtLeastPacific() {
-		desiredRgwInstances = 1
+	rgwsToSkipReconcile, err := controller.GetDaemonsToSkipReconcile(c.clusterInfo.Context, c.context, c.clusterInfo.Namespace, config.RgwType, AppName)
+	if err != nil {
+		return errors.Wrap(err, "failed to check for RGWs to skip reconcile")
 	}
+
+	// start a new deployment and scale up
+	// We force a single deployment and later set the deployment replica to the "instances" value
+	desiredRgwInstances := 1
 	for i := 0; i < desiredRgwInstances; i++ {
 		var err error
 
 		daemonLetterID := k8sutil.IndexToName(i)
+
+		if rgwsToSkipReconcile.Has(daemonLetterID) {
+			logger.Warningf("skipping reconcile of rgw daemon %q with label %q", daemonLetterID, cephv1.SkipReconcileLabelKey)
+			return nil
+		}
+
 		// Each rgw is id'ed by <store_name>-<letterID>
 		daemonName := fmt.Sprintf("%s-%s", c.store.Name, daemonLetterID)
 		// resource name is rook-ceph-rgw-<store_name>-<daemon_name>
 		resourceName := fmt.Sprintf("%s-%s-%s", AppName, c.store.Name, daemonLetterID)
 
 		rgwConfig := &rgwConfig{
-			ResourceName: resourceName,
-			DaemonID:     daemonName,
-			Realm:        realmName,
-			ZoneGroup:    zoneGroupName,
-			Zone:         zoneName,
+			ResourceName:   resourceName,
+			DaemonID:       daemonName,
+			Realm:          realmName,
+			ZoneGroup:      zoneGroupName,
+			Zone:           zoneName,
+			Auth:           c.store.Spec.Auth,
+			Protocols:      c.store.Spec.Protocols,
+			KeystoneSecret: keystoneSecret,
 		}
 
 		// We set the owner reference of the Secret to the Object controller instead of the replicaset
@@ -129,7 +153,7 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		// Unfortunately, on upgrade we would not set the flags which is not ideal for old clusters where we were no setting those flags
 		// The KV supports setting those flags even if the RGW is running
 		logger.Info("setting rgw config flags")
-		err = c.setDefaultFlagsMonConfigStore(rgwConfig)
+		err = c.setFlagsMonConfigStore(rgwConfig)
 		if err != nil {
 			// Getting EPERM typically happens when the flag may not be modified at runtime
 			// This is fine to ignore
@@ -211,6 +235,7 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		if err != nil {
 			logger.Warningf("could not get deployments for object store %q (matching label selector %q). %v", c.store.Name, c.storeLabelSelector(), err)
 		}
+
 		currentRgwInstances = len(deps.Items)
 		if currentRgwInstances == desiredRgwInstances {
 			logger.Infof("successfully scaled down rgw deployments to %d in object store %q", desiredRgwInstances, c.store.Name)
@@ -225,7 +250,7 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 func (c *clusterConfig) deleteStore() {
 	logger.Infof("deleting object store %q from namespace %q", c.store.Name, c.store.Namespace)
 
-	if !c.clusterSpec.External.Enable {
+	if !c.store.Spec.IsExternal() {
 		// Delete rgw CephX keys and configuration in centralized mon database
 		for i := 0; i < int(c.store.Spec.Gateway.Instances); i++ {
 			daemonLetterID := k8sutil.IndexToName(i)
@@ -290,12 +315,12 @@ func (r *ReconcileCephObjectStore) validateStore(s *cephv1.CephObjectStore) erro
 
 	// Validate the pool settings, but allow for empty pools specs in case they have already been created
 	// such as by the ceph mgr
-	if !emptyPool(s.Spec.MetadataPool) {
+	if !EmptyPool(s.Spec.MetadataPool) {
 		if err := pool.ValidatePoolSpec(r.context, r.clusterInfo, r.clusterSpec, &s.Spec.MetadataPool); err != nil {
 			return errors.Wrap(err, "invalid metadata pool spec")
 		}
 	}
-	if !emptyPool(s.Spec.DataPool) {
+	if !EmptyPool(s.Spec.DataPool) {
 		if err := pool.ValidatePoolSpec(r.context, r.clusterInfo, r.clusterSpec, &s.Spec.DataPool); err != nil {
 			return errors.Wrap(err, "invalid data pool spec")
 		}
@@ -308,13 +333,38 @@ func (c *clusterConfig) generateSecretName(id string) string {
 	return fmt.Sprintf("%s-%s-%s-keyring", AppName, c.store.Name, id)
 }
 
-func emptyPool(pool cephv1.PoolSpec) bool {
+func EmptyPool(pool cephv1.PoolSpec) bool {
 	return reflect.DeepEqual(pool, cephv1.PoolSpec{})
 }
 
-// BuildDomainName build the dns name to reach out the service endpoint
-func BuildDomainName(name, namespace string) string {
-	return fmt.Sprintf("%s-%s.%s.%s", AppName, name, namespace, svcDNSSuffix)
+func GetStableDomainName(s *cephv1.CephObjectStore) string {
+	if !s.Spec.IsExternal() {
+		return s.GetServiceDomainName()
+	}
+	return s.Spec.Gateway.ExternalRgwEndpoints[0].String()
+}
+
+func getAllDomainNames(s *cephv1.CephObjectStore) []string {
+	if s.Spec.IsExternal() {
+		domains := []string{}
+		for _, e := range s.Spec.Gateway.ExternalRgwEndpoints {
+			domains = append(domains, e.String())
+		}
+		logger.Debugf("domains: +%v", domains)
+		return domains
+	}
+
+	// do not return hosting.dnsNames in this list because Rook has no way of knowing for sure how
+	// they can be used. some might be TLS-only or non-TLS, or inaccessible from k8s
+	return []string{s.GetServiceDomainName()}
+}
+
+func getAllDNSEndpoints(s *cephv1.CephObjectStore, port int32, secure bool) []string {
+	endpoints := []string{}
+	for _, d := range getAllDomainNames(s) {
+		endpoints = append(endpoints, BuildDNSEndpoint(d, port, secure))
+	}
+	return endpoints
 }
 
 // ParseDomainName parse the name and namespace from the dns name
@@ -379,7 +429,7 @@ func GetTlsCaCert(objContext *Context, objectStoreSpec *cephv1.ObjectStoreSpec) 
 			}
 		}
 	} else if objectStoreSpec.GetServiceServingCert() != "" {
-		tlsCert, err = ioutil.ReadFile(ServiceServingCertCAFile)
+		tlsCert, err = os.ReadFile(ServiceServingCertCAFile)
 		if err != nil {
 			return nil, false, errors.Wrapf(err, "failed to fetch TLS certificate from %q", ServiceServingCertCAFile)
 		}

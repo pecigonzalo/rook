@@ -18,6 +18,7 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -38,10 +39,11 @@ type OSDUsage struct {
 type OSDNodeUsage struct {
 	ID          int         `json:"id"`
 	Name        string      `json:"name"`
+	DeviceClass string      `json:"device_class"`
 	CrushWeight json.Number `json:"crush_weight"`
 	Depth       json.Number `json:"depth"`
 	Reweight    json.Number `json:"reweight"`
-	KB          json.Number `json:"kb"`
+	KB          json.Number `json:"kb"` // KB is in KiB units
 	UsedKB      json.Number `json:"kb_used"`
 	AvailKB     json.Number `json:"kb_avail"`
 	Utilization json.Number `json:"utilization"`
@@ -65,8 +67,11 @@ type OSDDump struct {
 		Up  json.Number `json:"up"`
 		In  json.Number `json:"in"`
 	} `json:"osds"`
-	Flags          string              `json:"flags"`
-	CrushNodeFlags map[string][]string `json:"crush_node_flags"`
+	Flags             string              `json:"flags"`
+	CrushNodeFlags    map[string][]string `json:"crush_node_flags"`
+	FullRatio         float64             `json:"full_ratio"`
+	BackfillFullRatio float64             `json:"backfillfull_ratio"`
+	NearFullRatio     float64             `json:"nearfull_ratio"`
 }
 
 // IsFlagSet checks if an OSD flag is set
@@ -216,6 +221,66 @@ func GetOSDUsage(context *clusterd.Context, clusterInfo *ClusterInfo) (*OSDUsage
 	return &osdUsage, nil
 }
 
+func convertKibibytesToTebibytes(kib string) (float64, error) {
+	kibFloat, err := strconv.ParseFloat(kib, 64)
+	if err != nil {
+		return float64(0), errors.Wrap(err, "failed to convert string to float")
+	}
+	return kibFloat / float64(1024*1024*1024), nil
+}
+
+func ResizeOsdCrushWeight(actualOSD OSDNodeUsage, ctx *clusterd.Context, clusterInfo *ClusterInfo) (bool, error) {
+	currentCrushWeight, err := strconv.ParseFloat(actualOSD.CrushWeight.String(), 64)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed converting string to float for osd.%d crush weight %q", actualOSD.ID, actualOSD.CrushWeight.String())
+	}
+	// actualOSD.KB is in KiB units
+	calculatedCrushWeight, err := convertKibibytesToTebibytes(actualOSD.KB.String())
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to convert KiB to TiB for osd.%d crush weight %q", actualOSD.ID, actualOSD.KB.String())
+	}
+
+	// do not reweight if the calculated crush weight is 0 or less than equal to actualCrushWeight or there percentage resize is less than 1 percent
+	if calculatedCrushWeight == float64(0) {
+		logger.Debugf("osd size is 0 for osd.%d, not resizing the crush weights", actualOSD.ID)
+		return false, nil
+	} else if calculatedCrushWeight <= currentCrushWeight {
+		logger.Debugf("calculatedCrushWeight %f is less then current currentCrushWeight %f for osd.%d, not resizing the crush weights", calculatedCrushWeight, currentCrushWeight, actualOSD.ID)
+		return false, nil
+	} else if math.Abs(((calculatedCrushWeight - currentCrushWeight) / currentCrushWeight)) <= 0.01 {
+		logger.Debugf("calculatedCrushWeight %f is less then 1 percent increased from currentCrushWeight %f for osd.%d, not resizing the crush weights", calculatedCrushWeight, currentCrushWeight, actualOSD.ID)
+		return false, nil
+	}
+
+	calculatedCrushWeightString := fmt.Sprintf("%f", calculatedCrushWeight)
+	logger.Infof("updating osd.%d crush weight to %q for cluster in namespace %q", actualOSD.ID, calculatedCrushWeightString, clusterInfo.Namespace)
+	args := []string{"osd", "crush", "reweight", fmt.Sprintf("osd.%d", actualOSD.ID), calculatedCrushWeightString}
+	buf, err := NewCephCommand(ctx, clusterInfo, args).Run()
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to reweight osd.%d for cluster in namespace %q from actual crush weight %f to calculated crush weight %f: %s", actualOSD.ID, clusterInfo.Namespace, currentCrushWeight, calculatedCrushWeight, string(buf))
+	}
+
+	return true, nil
+}
+
+func SetDeviceClass(context *clusterd.Context, clusterInfo *ClusterInfo, osdID int, deviceClass string) error {
+	// First remove the existing device class
+	args := []string{"osd", "crush", "rm-device-class", fmt.Sprintf("osd.%d", osdID)}
+	buf, err := NewCephCommand(context, clusterInfo, args).Run()
+	if err != nil {
+		return errors.Wrap(err, "failed to remove device class. "+string(buf))
+	}
+
+	// Second, apply the desired device class
+	args = []string{"osd", "crush", "set-device-class", deviceClass, fmt.Sprintf("osd.%d", osdID)}
+	buf, err = NewCephCommand(context, clusterInfo, args).Run()
+	if err != nil {
+		return errors.Wrap(err, "failed to set the device class. "+string(buf))
+	}
+
+	return nil
+}
+
 func GetOSDPerfStats(context *clusterd.Context, clusterInfo *ClusterInfo) (*OSDPerfStats, error) {
 	args := []string{"osd", "perf"}
 	buf, err := NewCephCommand(context, clusterInfo, args).Run()
@@ -348,23 +413,14 @@ type OSDOkToStopStats struct {
 // maxReturned=0 is the same as maxReturned=1.
 func OSDOkToStop(context *clusterd.Context, clusterInfo *ClusterInfo, osdID, maxReturned int) ([]int, error) {
 	args := []string{"osd", "ok-to-stop", strconv.Itoa(osdID)}
-	returnsList := false // does the ceph call return a list of OSD IDs?
-	if clusterInfo.CephVersion.IsAtLeastPacific() {
-		returnsList = true
-		// NOTE: if the number of OSD IDs given in the CLI arg query is Q and --max=N is given, if
-		// N < Q, Ceph treats the query as though max=Q instead, always returning at least Q OSDs.
-		args = append(args, fmt.Sprintf("--max=%d", maxReturned))
-	}
+	// NOTE: if the number of OSD IDs given in the CLI arg query is Q and --max=N is given, if
+	// N < Q, Ceph treats the query as though max=Q instead, always returning at least Q OSDs.
+	args = append(args, fmt.Sprintf("--max=%d", maxReturned))
 
 	buf, err := NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
 		// is not ok to stop (or command error)
 		return []int{}, errors.Wrapf(err, "OSD %d is not ok to stop", osdID)
-	}
-
-	if !returnsList {
-		// If does not return list, just return a slice including only the OSD ID queried
-		return []int{osdID}, nil
 	}
 
 	var stats OSDOkToStopStats

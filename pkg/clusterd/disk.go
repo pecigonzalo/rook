@@ -19,6 +19,7 @@ package clusterd
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -30,8 +31,12 @@ import (
 )
 
 var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "inventory")
-	isRBD  = regexp.MustCompile("^rbd[0-9]+p?[0-9]{0,}$")
+	logger         = capnslog.NewPackageLogger("github.com/rook/rook", "inventory")
+	isRBD          = regexp.MustCompile("^rbd[0-9]+p?[0-9]{0,}$")
+	listAllDevices = "all"
+
+	// We need to allow dm- devices (Kubernetes mountpoints) because dm- devices name are used as names for meta device
+	allowDeviceNamePattern = regexp.MustCompile("dm-")
 )
 
 func supportedDeviceType(device string) bool {
@@ -41,20 +46,20 @@ func supportedDeviceType(device string) bool {
 		device == sys.LVMType ||
 		device == sys.MultiPath ||
 		device == sys.PartType ||
-		device == sys.LinearType
+		device == sys.LinearType ||
+		(getAllowLoopDevices() && device == sys.LoopType)
 }
 
 // GetDeviceEmpty check whether a device is completely empty
 func GetDeviceEmpty(device *sys.LocalDisk) bool {
-	return device.Parent == "" && supportedDeviceType(device.Type) && len(device.Partitions) == 0 && device.Filesystem == ""
+	return supportedDeviceType(device.Type) && len(device.Partitions) == 0 && device.Filesystem == ""
 }
 
 func ignoreDevice(d string) bool {
 	return isRBD.MatchString(d)
 }
 
-// DiscoverDevices returns all the details of devices available on the local node
-func DiscoverDevices(executor exec.Executor) ([]*sys.LocalDisk, error) {
+func DiscoverDevicesWithFilter(executor exec.Executor, deviceFilter, metaDevice string) ([]*sys.LocalDisk, error) {
 	var disks []*sys.LocalDisk
 	devices, err := sys.ListDevices(executor)
 	if err != nil {
@@ -66,6 +71,11 @@ func DiscoverDevices(executor exec.Executor) ([]*sys.LocalDisk, error) {
 		if ignoreDevice(d) {
 			// skip device
 			logger.Warningf("skipping rbd device %q", d)
+			continue
+		}
+
+		if deviceFilter != "" && !deviceMatchWithFilter(d, deviceFilter, metaDevice) {
+			logger.Warningf("device %q skipped due to filter %q", d, deviceFilter)
 			continue
 		}
 
@@ -111,6 +121,35 @@ func DiscoverDevices(executor exec.Executor) ([]*sys.LocalDisk, error) {
 	return disks, nil
 }
 
+func deviceMatchWithFilter(device string, filter, metaDevice string) bool {
+	if filter == listAllDevices || device == metaDevice {
+		return true
+	}
+
+	if allowDeviceNamePattern.MatchString(device) {
+		return true
+	}
+
+	pattern, err := regexp.Compile(filter)
+	if err != nil {
+		return false
+	}
+
+	if !pattern.MatchString(device) {
+		return false
+	}
+	return true
+}
+
+// DiscoverDevices returns all the details of devices available on the local node
+func DiscoverDevices(executor exec.Executor) ([]*sys.LocalDisk, error) {
+	disks, err := DiscoverDevicesWithFilter(executor, "", "")
+	if err != nil {
+		return nil, err
+	}
+	return disks, nil
+}
+
 // PopulateDeviceInfo returns the information of the specified block device
 func PopulateDeviceInfo(d string, executor exec.Executor) (*sys.LocalDisk, error) {
 	diskProps, err := sys.GetDeviceProperties(d, executor)
@@ -128,10 +167,12 @@ func PopulateDeviceInfo(d string, executor exec.Executor) (*sys.LocalDisk, error
 
 	// get the UUID for disks
 	var diskUUID string
-	if diskType != sys.PartType {
-		diskUUID, err = sys.GetDiskUUID(d, executor)
+	if diskType == sys.DiskType {
+		uuid, err := sys.GetDiskUUID(d, executor)
 		if err != nil {
-			return nil, err
+			logger.Warning(err)
+		} else {
+			diskUUID = uuid
 		}
 	}
 
@@ -165,6 +206,12 @@ func PopulateDeviceInfo(d string, executor exec.Executor) (*sys.LocalDisk, error
 	}
 	if val, ok := diskProps["KNAME"]; ok {
 		disk.KernelName = path.Base(val)
+	}
+	if val, ok := diskProps["FSTYPE"]; ok && val != "" {
+		disk.Filesystem = path.Base(val)
+	}
+	if val, ok := diskProps["MOUNTPOINT"]; ok && val != "" {
+		disk.Mountpoint = path.Base(val)
 	}
 
 	return disk, nil
@@ -204,4 +251,8 @@ func PopulateDeviceUdevInfo(d string, executor exec.Executor, disk *sys.LocalDis
 	}
 
 	return disk, nil
+}
+
+func getAllowLoopDevices() bool {
+	return os.Getenv("CEPH_VOLUME_ALLOW_LOOP_DEVICES") == "true"
 }

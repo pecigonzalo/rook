@@ -18,6 +18,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path"
@@ -31,6 +33,7 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	opconfig "github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/display"
@@ -38,6 +41,8 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 const (
@@ -48,14 +53,23 @@ const (
 	volumeMountSubPath                      = "data"
 	crashVolumeName                         = "rook-ceph-crash"
 	daemonSocketDir                         = "/run/ceph"
-	livenessProbeInitialDelaySeconds  int32 = 10
-	startupProbeFailuresDaemonDefault int32 = 6 // multiply by 10 = effective startup timeout
-	startupProbeFailuresDaemonOSD     int32 = 9 // multiply by 10 = effective startup timeout
+	daemonSocketsSubPath                    = "/exporter"
 	logCollector                            = "log-collector"
 	DaemonIDLabel                           = "ceph_daemon_id"
 	daemonTypeLabel                         = "ceph_daemon_type"
 	ExternalMgrAppName                      = "rook-ceph-mgr-external"
+	ExternalCephExporterName                = "rook-ceph-exporter-external"
 	ServiceExternalMetricName               = "http-external-metrics"
+	CephUserID                              = int64(167)
+	livenessProbeTimeoutSeconds       int32 = 5
+	livenessProbeInitialDelaySeconds  int32 = 10
+	startupProbeFailuresDaemonDefault int32 = 6 // multiply by 10 = effective startup timeout
+	// The OSD requires a long timeout in case the OSD is taking extra time to
+	// scrub data during startup. We don't want the probe to disrupt the OSD update
+	// and restart the OSD prematurely. So we set a really long timeout to avoid
+	// disabling the startup and liveness probes completely.
+	// The default is two hours after multiplying by the 10s retry interval.
+	startupProbeFailuresDaemonOSD int32 = 12 * 60
 )
 
 type daemonConfig struct {
@@ -66,25 +80,54 @@ type daemonConfig struct {
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "ceph-spec")
 
 var (
+	osdLivenessProbeScript = `
+outp="$(ceph --admin-daemon %s %s 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && [ ! -f /tmp/osd-sleep ]; then
+	echo "ceph daemon health check failed with the following output:"
+	echo "$outp" | sed -e 's/^/> /g'
+	exit $rc
+fi
+`
+
+	livenessProbeScript = `
+outp="$(ceph --admin-daemon %s %s 2>&1)"
+rc=$?
+if [ $rc -ne 0 ]; then
+	echo "ceph daemon health check failed with the following output:"
+	echo "$outp" | sed -e 's/^/> /g'
+	exit $rc
+fi
+`
+
 	cronLogRotate = `
 CEPH_CLIENT_ID=%s
 PERIODICITY=%s
 LOG_ROTATE_CEPH_FILE=/etc/logrotate.d/ceph
-
-if [ -z "$PERIODICITY" ]; then
-	PERIODICITY=24h
-fi
+LOG_MAX_SIZE=%s
+ROTATE=%s
+ADDITIONAL_LOG_FILES=%s
 
 # edit the logrotate file to only rotate a specific daemon log
 # otherwise we will logrotate log files without reloading certain daemons
 # this might happen when multiple daemons run on the same machine
-sed -i "s|*.log|$CEPH_CLIENT_ID.log|" "$LOG_ROTATE_CEPH_FILE"
+sed -i "s|*.log|$CEPH_CLIENT_ID.log $ADDITIONAL_LOG_FILES|" "$LOG_ROTATE_CEPH_FILE"
+
+# replace default daily with given user input
+sed --in-place "s/daily/$PERIODICITY/g" "$LOG_ROTATE_CEPH_FILE"
+
+# replace rotate count, default 7 for all ceph daemons other than rbd-mirror
+sed --in-place "s/rotate 7/rotate $ROTATE/g" "$LOG_ROTATE_CEPH_FILE"
+
+if [ "$LOG_MAX_SIZE" != "0" ]; then
+	# adding maxsize $LOG_MAX_SIZE at the 4th line of the logrotate config file with 4 spaces to maintain indentation
+	sed --in-place "4i \ \ \ \ maxsize $LOG_MAX_SIZE" "$LOG_ROTATE_CEPH_FILE"
+fi
 
 while true; do
-	sleep "$PERIODICITY"
-	echo "starting log rotation"
-	logrotate --verbose --force "$LOG_ROTATE_CEPH_FILE"
-	echo "I am going to sleep now, see you in $PERIODICITY"
+	# we don't force the logrorate but we let the logrotate binary handle the rotation based on user's input for periodicity and size
+	logrotate --verbose "$LOG_ROTATE_CEPH_FILE"
+	sleep 15m
 done
 `
 )
@@ -149,12 +192,14 @@ func ConfGeneratedInPodVolumeAndMount() (v1.Volume, v1.VolumeMount) {
 
 // PodVolumes fills in the volumes parameter with the common list of Kubernetes volumes for use in Ceph pods.
 // This function is only used for OSDs.
-func PodVolumes(dataPaths *config.DataPathMap, dataDirHostPath string, confGeneratedInPod bool) []v1.Volume {
+func PodVolumes(dataPaths *config.DataPathMap, dataDirHostPath string, exporterHostPath string, confGeneratedInPod bool) []v1.Volume {
 
 	dataDirSource := v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}
 	if dataDirHostPath != "" {
 		dataDirSource = v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: dataDirHostPath}}
 	}
+	hostPathType := v1.HostPathDirectoryOrCreate
+	sockDirSource := v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: path.Join(exporterHostPath, daemonSocketsSubPath), Type: &hostPathType}}
 	configVolume, _ := configOverrideConfigMapVolumeAndMount()
 	if confGeneratedInPod {
 		configVolume, _ = ConfGeneratedInPodVolumeAndMount()
@@ -164,6 +209,7 @@ func PodVolumes(dataPaths *config.DataPathMap, dataDirHostPath string, confGener
 		{Name: k8sutil.DataDirVolume, VolumeSource: dataDirSource},
 		configVolume,
 	}
+	v = append(v, v1.Volume{Name: "ceph-daemons-sock-dir", VolumeSource: sockDirSource})
 	v = append(v, StoredLogAndCrashVolume(dataPaths.HostLogDir(), dataPaths.HostCrashDir())...)
 
 	return v
@@ -182,6 +228,7 @@ func CephVolumeMounts(dataPaths *config.DataPathMap, confGeneratedInPod bool) []
 		configMount,
 		// Rook doesn't run in ceph containers, so it doesn't need the config override mounted
 	}
+	v = append(v, v1.VolumeMount{Name: "ceph-daemons-sock-dir", MountPath: daemonSocketDir})
 	v = append(v, StoredLogAndCrashVolumeMount(dataPaths.ContainerLogDir(), dataPaths.ContainerCrashDir())...)
 
 	return v
@@ -195,13 +242,19 @@ func RookVolumeMounts(dataPaths *config.DataPathMap, confGeneratedInPod bool) []
 }
 
 // DaemonVolumesBase returns the common / static set of volumes.
-func DaemonVolumesBase(dataPaths *config.DataPathMap, keyringResourceName string) []v1.Volume {
+func DaemonVolumesBase(dataPaths *config.DataPathMap, keyringResourceName string, dataDirHostPath string) []v1.Volume {
 	configOverrideVolume, _ := configOverrideConfigMapVolumeAndMount()
 	vols := []v1.Volume{
 		configOverrideVolume,
 	}
 	if keyringResourceName != "" {
 		vols = append(vols, keyring.Volume().Resource(keyringResourceName))
+	}
+	// data is persisted to host
+	if dataDirHostPath != "" {
+		hostPathType := v1.HostPathDirectoryOrCreate
+		src := v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: path.Join(dataDirHostPath, daemonSocketsSubPath), Type: &hostPathType}}
+		vols = append(vols, v1.Volume{Name: "ceph-daemons-sock-dir", VolumeSource: src})
 	}
 	if dataPaths.HostLogAndCrashDir != "" {
 		// logs are not persisted to host
@@ -252,8 +305,8 @@ func DaemonVolumesContainsPVC(volumes []v1.Volume) bool {
 
 // DaemonVolumes returns the pod volumes used by all Ceph daemons. If keyring resource name is
 // empty, there will be no keyring volume created from a secret.
-func DaemonVolumes(dataPaths *config.DataPathMap, keyringResourceName string) []v1.Volume {
-	vols := DaemonVolumesBase(dataPaths, keyringResourceName)
+func DaemonVolumes(dataPaths *config.DataPathMap, keyringResourceName string, dataDirHostPath string) []v1.Volume {
+	vols := DaemonVolumesBase(dataPaths, keyringResourceName, dataDirHostPath)
 	vols = append(vols, DaemonVolumesDataHostPath(dataPaths)...)
 	return vols
 }
@@ -261,10 +314,13 @@ func DaemonVolumes(dataPaths *config.DataPathMap, keyringResourceName string) []
 // DaemonVolumeMounts returns volume mounts which correspond to the DaemonVolumes. These
 // volume mounts are shared by most all Ceph daemon containers, both init and standard. If keyring
 // resource name is empty, there will be no keyring mounted in the container.
-func DaemonVolumeMounts(dataPaths *config.DataPathMap, keyringResourceName string) []v1.VolumeMount {
+func DaemonVolumeMounts(dataPaths *config.DataPathMap, keyringResourceName string, dataDirHostPath string) []v1.VolumeMount {
 	_, configOverrideMount := configOverrideConfigMapVolumeAndMount()
 	mounts := []v1.VolumeMount{
 		configOverrideMount,
+	}
+	if dataDirHostPath != "" {
+		mounts = append(mounts, v1.VolumeMount{Name: "ceph-daemons-sock-dir", MountPath: daemonSocketDir})
 	}
 	if keyringResourceName != "" {
 		mounts = append(mounts, keyring.VolumeMount().Resource(keyringResourceName))
@@ -337,8 +393,8 @@ func AdminFlags(cluster *client.ClusterInfo) []string {
 func NetworkBindingFlags(cluster *client.ClusterInfo, spec *cephv1.ClusterSpec) []string {
 	var args []string
 
-	// As of Pacific, Ceph supports dual-stack, so setting IPv6 family without disabling IPv4 binding actually enables dual-stack
-	// This is likely not user's intent, so on Pacific let's make sure to disable IPv4 when IPv6 is selected
+	// Ceph supports dual-stack, so setting IPv6 family without disabling IPv4 binding actually enables dual-stack
+	// This is likely not user's intent, so let's make sure to disable IPv4 when IPv6 is selected
 	if !spec.Network.DualStack {
 		switch spec.Network.IPFamily {
 		case cephv1.IPv4:
@@ -350,16 +406,8 @@ func NetworkBindingFlags(cluster *client.ClusterInfo, spec *cephv1.ClusterSpec) 
 			args = append(args, config.NewFlag("ms-bind-ipv6", "true"))
 		}
 	} else {
-		if cluster.CephVersion.IsAtLeastPacific() {
-			args = append(args, config.NewFlag("ms-bind-ipv4", "true"))
-			args = append(args, config.NewFlag("ms-bind-ipv6", "true"))
-		} else {
-			logger.Info("dual-stack is only supported on ceph pacific")
-			// Still acknowledge IPv6, nothing to do for IPv4 since it will always be "on"
-			if spec.Network.IPFamily == cephv1.IPv6 {
-				args = append(args, config.NewFlag("ms-bind-ipv6", "true"))
-			}
-		}
+		args = append(args, config.NewFlag("ms-bind-ipv4", "true"))
+		args = append(args, config.NewFlag("ms-bind-ipv6", "true"))
 	}
 
 	return args
@@ -372,11 +420,39 @@ func ContainerEnvVarReference(envVarName string) string {
 }
 
 // DaemonEnvVars returns the container environment variables used by all Ceph daemons.
-func DaemonEnvVars(image string) []v1.EnvVar {
+func DaemonEnvVars(cephClusterSpec *cephv1.ClusterSpec) []v1.EnvVar {
+	networkEnv := ApplyNetworkEnv(cephClusterSpec)
+	cephDaemonsEnvVars := append(k8sutil.ClusterDaemonEnvVars(cephClusterSpec.CephVersion.Image), networkEnv...)
+
 	return append(
-		k8sutil.ClusterDaemonEnvVars(image),
+		cephDaemonsEnvVars,
 		config.StoredMonHostEnvVars()...,
 	)
+}
+
+func ApplyNetworkEnv(cephClusterSpec *cephv1.ClusterSpec) []v1.EnvVar {
+	if cephClusterSpec.Network.Connections != nil {
+		msgr2Required := false
+		encryptionEnabled := false
+		compressionEnabled := false
+		if cephClusterSpec.Network.Connections.RequireMsgr2 {
+			msgr2Required = true
+		}
+		if cephClusterSpec.Network.Connections.Encryption != nil && cephClusterSpec.Network.Connections.Encryption.Enabled {
+			encryptionEnabled = true
+		}
+		if cephClusterSpec.Network.Connections.Compression != nil && cephClusterSpec.Network.Connections.Compression.Enabled {
+			compressionEnabled = true
+		}
+		envVarValue := fmt.Sprintf("msgr2_%t_encryption_%t_compression_%t", msgr2Required, encryptionEnabled, compressionEnabled)
+
+		rookMsgr2Env := []v1.EnvVar{{
+			Name:  "ROOK_MSGR2",
+			Value: envVarValue,
+		}}
+		return rookMsgr2Env
+	}
+	return []v1.EnvVar{}
 }
 
 // AppLabels returns labels common for all Rook-Ceph applications which may be useful for admins.
@@ -422,19 +498,23 @@ func CheckPodMemory(name string, resources v1.ResourceRequirements, cephPodMinim
 
 	if !podMemoryLimit.IsZero() {
 		// This means LIMIT and REQUEST are either identical or different but still we use LIMIT as a reference
-		if uint64(podMemoryLimit.Value()) < display.MbTob(cephPodMinimumMemory) {
+		// nolint:gosec // G115 int64 to uint64 conversion is reasonabe here
+		upodMemoryLimit := uint64(podMemoryLimit.Value())
+		if upodMemoryLimit < display.MbTob(cephPodMinimumMemory) {
 			// allow the configuration if less than the min, but print a warning
-			logger.Warningf("running the %q daemon(s) with %dMB of ram, but at least %dMB is recommended", name, display.BToMb(uint64(podMemoryLimit.Value())), cephPodMinimumMemory)
+			logger.Warningf("running the %q daemon(s) with %dMB of ram, but at least %dMB is recommended", name, display.BToMb(upodMemoryLimit), cephPodMinimumMemory)
 		}
 
 		// This means LIMIT < REQUEST
 		// Kubernetes will refuse to schedule that pod however it's still valuable to indicate that user's input was incorrect
-		if uint64(podMemoryLimit.Value()) < uint64(podMemoryRequest.Value()) {
+		// nolint:gosec // G115 int64 to uint64 conversion is reasonabe here
+		upodMemoryRequest := uint64(podMemoryRequest.Value())
+		if upodMemoryLimit < upodMemoryRequest {
 			extraErrorLine := `\n
 			User has specified a pod memory limit %dmb below the pod memory request %dmb in the cluster CR.\n
 			Rook will create pods that are expected to fail to serve as a more apparent error indicator to the user.`
 
-			return errors.Errorf(extraErrorLine, display.BToMb(uint64(podMemoryLimit.Value())), display.BToMb(uint64(podMemoryRequest.Value())))
+			return errors.Errorf(extraErrorLine, display.BToMb(upodMemoryLimit), display.BToMb(upodMemoryRequest))
 		}
 	}
 
@@ -452,9 +532,11 @@ func CheckPodMemory(name string, resources v1.ResourceRequirements, cephPodMinim
 func ChownCephDataDirsInitContainer(
 	dpm config.DataPathMap,
 	containerImage string,
+	containerImagePullPolicy v1.PullPolicy,
 	volumeMounts []v1.VolumeMount,
 	resources v1.ResourceRequirements,
 	securityContext *v1.SecurityContext,
+	configDir string,
 ) v1.Container {
 	args := make([]string, 0, 5)
 	args = append(args,
@@ -463,7 +545,12 @@ func ChownCephDataDirsInitContainer(
 		"ceph:ceph",
 		config.VarLogCephDir,
 		config.VarLibCephCrashDir,
+		daemonSocketDir,
 	)
+	if configDir != "" {
+		args = append(args, configDir)
+	}
+
 	if dpm.ContainerDataDir != "" {
 		args = append(args, dpm.ContainerDataDir)
 	}
@@ -472,6 +559,7 @@ func ChownCephDataDirsInitContainer(
 		Command:         []string{"chown"},
 		Args:            args,
 		Image:           containerImage,
+		ImagePullPolicy: containerImagePullPolicy,
 		VolumeMounts:    volumeMounts,
 		Resources:       resources,
 		SecurityContext: securityContext,
@@ -487,6 +575,7 @@ func ChownCephDataDirsInitContainer(
 func GenerateMinimalCephConfInitContainer(
 	username, keyringPath string,
 	containerImage string,
+	containerImagePullPolicy v1.PullPolicy,
 	volumeMounts []v1.VolumeMount,
 	resources v1.ResourceRequirements,
 	securityContext *v1.SecurityContext,
@@ -514,6 +603,7 @@ cat ` + cfgPath + `
 		Command:         []string{"/bin/bash", "-c", confScript},
 		Args:            []string{},
 		Image:           containerImage,
+		ImagePullPolicy: containerImagePullPolicy,
 		VolumeMounts:    volumeMounts,
 		Env:             config.StoredMonHostEnvVars(),
 		Resources:       resources,
@@ -559,25 +649,34 @@ func StoredLogAndCrashVolumeMount(varLogCephDir, varLibCephCrashDir string) []v1
 // that it can be called, and that it returns 0
 func GenerateLivenessProbeExecDaemon(daemonType, daemonID string) *v1.Probe {
 	confDaemon := getDaemonConfig(daemonType, daemonID)
+	probeScript := livenessProbeScript
+	if daemonType == opconfig.OsdType {
+		probeScript = osdLivenessProbeScript
+	}
 
 	return &v1.Probe{
-		Handler: v1.Handler{
+		ProbeHandler: v1.ProbeHandler{
 			Exec: &v1.ExecAction{
 				// Run with env -i to clean env variables in the exec context
 				// This avoids conflict with the CEPH_ARGS env
 				//
 				// Example:
 				// env -i sh -c "ceph --admin-daemon /run/ceph/ceph-osd.0.asok status"
+				//
+				// Ceph gives pretty un-diagnostic error message when `ceph status` or `ceph mon_status` command fails.
+				// Add a clear message after Ceph's to help.
+				// ref: https://github.com/rook/rook/issues/9846
 				Command: []string{
 					"env",
 					"-i",
 					"sh",
 					"-c",
-					fmt.Sprintf("ceph --admin-daemon %s %s", confDaemon.buildSocketPath(), confDaemon.buildAdminSocketCommand()),
+					fmt.Sprintf(probeScript, confDaemon.buildSocketPath(), confDaemon.buildAdminSocketCommand()),
 				},
 			},
 		},
 		InitialDelaySeconds: livenessProbeInitialDelaySeconds,
+		TimeoutSeconds:      livenessProbeTimeoutSeconds,
 	}
 }
 
@@ -635,7 +734,22 @@ func PodSecurityContext() *v1.SecurityContext {
 
 	return &v1.SecurityContext{
 		Privileged: &privileged,
+		Capabilities: &v1.Capabilities{
+			Add: []v1.Capability{},
+			Drop: []v1.Capability{
+				"NET_RAW",
+			},
+		},
 	}
+}
+
+// PodSecurityContext detects if the pod needs privileges to run
+func CephSecurityContext() *v1.SecurityContext {
+	context := PodSecurityContext()
+	cephUserID := CephUserID
+	context.RunAsUser = &cephUserID
+	context.RunAsGroup = &cephUserID
+	return context
 }
 
 // PrivilegedContext returns a privileged Pod security context
@@ -651,11 +765,54 @@ func PrivilegedContext(runAsRoot bool) *v1.SecurityContext {
 		sec.RunAsUser = &rootUser
 	}
 
+	sec.Capabilities = &v1.Capabilities{
+		Add: []v1.Capability{},
+		Drop: []v1.Capability{
+			"NET_RAW",
+		},
+	}
 	return sec
 }
 
-// LogCollectorContainer runs a cron job to rotate logs
-func LogCollectorContainer(daemonID, ns string, c cephv1.ClusterSpec) *v1.Container {
+func GetLogRotateConfig(c cephv1.ClusterSpec) (resource.Quantity, string) {
+	var maxLogSize resource.Quantity
+	if c.LogCollector.MaxLogSize != nil {
+		size := c.LogCollector.MaxLogSize.Value() / 1000 / 1000
+		if size == 0 {
+			size = 1
+			logger.Info("maxLogSize is 0M setting to minimum of 1M")
+		}
+
+		maxLogSize = resource.MustParse(fmt.Sprintf("%dM", size))
+	}
+
+	var periodicity string
+	switch c.LogCollector.Periodicity {
+	case "1h", "hourly":
+		periodicity = "hourly"
+	case "weekly", "monthly":
+		periodicity = c.LogCollector.Periodicity
+	default:
+		periodicity = "daily"
+	}
+
+	return maxLogSize, periodicity
+}
+
+// LogCollectorContainer rotate logs
+func LogCollectorContainer(daemonID, ns string, c cephv1.ClusterSpec, additionalLogFiles ...string) *v1.Container {
+	maxLogSize, periodicity := GetLogRotateConfig(c)
+	rotation := "7"
+
+	if strings.Contains(daemonID, "-client.rbd-mirror") {
+		rotation = "28"
+	}
+
+	// Convert the variadic string slice into a space-separated string
+	additionalLogs := strings.Join(additionalLogFiles, " ")
+	logger.Debugf("additional log file %q will be used for logCollector", additionalLogs)
+	logger.Debugf("setting periodicity to %q. Supported periodicity are hourly, daily, weekly and monthly", periodicity)
+
 	return &v1.Container{
 		Name: logCollector,
 		Command: []string{
@@ -664,12 +821,33 @@ func LogCollectorContainer(daemonID, ns string, c cephv1.ClusterSpec) *v1.Contai
 			"-e", // Exit immediately if a command exits with a non-zero status.
 			"-m", // Terminal job control, allows job to be terminated by SIGTERM
 			"-c", // Command to run
-			fmt.Sprintf(cronLogRotate, daemonID, c.LogCollector.Periodicity),
+			fmt.Sprintf(cronLogRotate, daemonID, periodicity, maxLogSize.String(), rotation, additionalLogs),
 		},
 		Image:           c.CephVersion.Image,
-		VolumeMounts:    DaemonVolumeMounts(config.NewDatalessDaemonDataPathMap(ns, c.DataDirHostPath), ""),
+		ImagePullPolicy: GetContainerImagePullPolicy(c.CephVersion.ImagePullPolicy),
+		VolumeMounts:    DaemonVolumeMounts(config.NewDatalessDaemonDataPathMap(ns, c.DataDirHostPath), "", c.DataDirHostPath),
 		SecurityContext: PodSecurityContext(),
 		Resources:       cephv1.GetLogCollectorResources(c.Resources),
+		// We need a TTY for the bash job control (enabled by -m)
+		TTY: true,
+	}
+}
+
+// rgw operations will be logged in sidecar ops-log
+func RgwOpsLogSidecarContainer(opsLogFile, ns string, c cephv1.ClusterSpec, Resources v1.ResourceRequirements) *v1.Container {
+	return &v1.Container{
+		Name: "ops-log",
+		Command: []string{
+			"bash",
+			"-x", // Enable debugging mode
+			"-c", // Run the following command
+			fmt.Sprintf("tail -n+1 -F %s", path.Join(config.VarLogCephDir, opsLogFile)),
+		},
+		Image:           c.CephVersion.Image,
+		ImagePullPolicy: GetContainerImagePullPolicy(c.CephVersion.ImagePullPolicy),
+		VolumeMounts:    DaemonVolumeMounts(config.NewDatalessDaemonDataPathMap(ns, c.DataDirHostPath), "", c.DataDirHostPath),
+		SecurityContext: PodSecurityContext(),
+		Resources:       Resources,
 		// We need a TTY for the bash job control (enabled by -m)
 		TTY: true,
 	}
@@ -761,4 +939,65 @@ func ConfigureExternalMetricsEndpoint(ctx *clusterd.Context, monitoringSpec ceph
 
 func extractMgrIP(rawActiveAddr string) string {
 	return strings.Split(rawActiveAddr, ":")[0]
+}
+
+func GetContainerImagePullPolicy(containerImagePullPolicy v1.PullPolicy) v1.PullPolicy {
+	if containerImagePullPolicy == "" {
+		return v1.PullIfNotPresent
+	}
+
+	return containerImagePullPolicy
+}
+
+// GenerateLivenessProbeTcpPort generates a liveness probe that makes sure a daemon has
+// TCP a socket binded to specific port, and may create new connection.
+func GenerateLivenessProbeTcpPort(port, failureThreshold int32) *v1.Probe {
+	return &v1.Probe{
+		ProbeHandler: v1.ProbeHandler{
+			TCPSocket: &v1.TCPSocketAction{
+				Port: intstr.IntOrString{IntVal: port},
+			},
+		},
+		InitialDelaySeconds: livenessProbeInitialDelaySeconds,
+		TimeoutSeconds:      livenessProbeTimeoutSeconds,
+		FailureThreshold:    failureThreshold,
+	}
+}
+
+// GenerateLivenessProbeViaRpcinfo creates a liveness probe using 'rpcinfo' shell
+// command which checks that the local NFS daemon has TCP a socket binded to
+// specific port, and it has valid reply to NULL RPC request.
+func GenerateLivenessProbeViaRpcinfo(port uint16, failureThreshold int32) *v1.Probe {
+	bb := make([]byte, 2)
+	binary.BigEndian.PutUint16(bb, port) // port-num in network-order
+	servAddr := fmt.Sprintf("127.0.0.1.%d.%d", bb[0], bb[1])
+	return &v1.Probe{
+		ProbeHandler: v1.ProbeHandler{
+			Exec: &v1.ExecAction{
+				Command: []string{"rpcinfo", "-a", servAddr, "-T", "tcp", "nfs", "4"},
+			},
+		},
+		InitialDelaySeconds: livenessProbeInitialDelaySeconds,
+		TimeoutSeconds:      livenessProbeTimeoutSeconds,
+		FailureThreshold:    failureThreshold,
+	}
+}
+
+func GetDaemonsToSkipReconcile(ctx context.Context, clusterd *clusterd.Context, namespace, daemonName, label string) (sets.Set[string], error) {
+	listOpts := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s,%s", k8sutil.AppAttr, label, cephv1.SkipReconcileLabelKey)}
+
+	deployments, err := clusterd.Clientset.AppsV1().Deployments(namespace).List(ctx, listOpts)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to query %q to skip reconcile", daemonName)
+	}
+
+	result := sets.New[string]()
+	for _, deployment := range deployments.Items {
+		if daemonID, ok := deployment.Labels[daemonName]; ok {
+			logger.Infof("found %s %q pod to skip reconcile", daemonID, daemonName)
+			result.Insert(daemonID)
+		}
+	}
+
+	return result, nil
 }

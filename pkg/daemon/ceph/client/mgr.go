@@ -22,10 +22,16 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
+	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 )
 
 var (
 	moduleEnableWaitTime = 5 * time.Second
+)
+
+const (
+	readBalancerMode      = "read"
+	upmapReadBalancerMode = "upmap-read"
 )
 
 func CephMgrMap(context *clusterd.Context, clusterInfo *ClusterInfo) (*MgrMap, error) {
@@ -69,14 +75,9 @@ func MgrEnableModule(context *clusterd.Context, clusterInfo *ClusterInfo, name s
 	retryCount := 5
 	var err error
 	for i := 0; i < retryCount; i++ {
-		/* In Pacific the balancer is now on by default in upmap mode.
-		In earlier versions, the balancer was included in the ``always_on_modules`` list, but needed to be
-		turned on explicitly using the ``ceph balancer on`` command. */
-		if name == "balancer" && clusterInfo.CephVersion.IsAtLeastPacific() {
-			logger.Debug("balancer module is already 'on' on pacific, doing nothing", name)
+		if name == "balancer" {
+			logger.Debug("balancer module is always 'on', doing nothing", name)
 			return nil
-		} else if name == "balancer" {
-			err = enableDisableBalancerModule(context, clusterInfo, "on")
 		} else {
 			err = enableModule(context, clusterInfo, name, force, "enable")
 		}
@@ -137,12 +138,12 @@ func setBalancerMode(context *clusterd.Context, clusterInfo *ClusterInfo, mode s
 	return nil
 }
 
-// setMinCompatClientLuminous set the minimum compatibility for clients to Luminous
-func setMinCompatClientLuminous(context *clusterd.Context, clusterInfo *ClusterInfo) error {
-	args := []string{"osd", "set-require-min-compat-client", "luminous", "--yes-i-really-mean-it"}
+// setMinCompatClient set the minimum compatibility for clients
+func setMinCompatClient(context *clusterd.Context, clusterInfo *ClusterInfo, version string) error {
+	args := []string{"osd", "set-require-min-compat-client", version, "--yes-i-really-mean-it"}
 	_, err := NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
-		return errors.Wrap(err, "failed to set set-require-min-compat-client to luminous")
+		return errors.Wrapf(err, "failed to set set-require-min-compat-client to %q", version)
 	}
 
 	return nil
@@ -170,8 +171,12 @@ func mgrSetBalancerMode(context *clusterd.Context, clusterInfo *ClusterInfo, bal
 
 // ConfigureBalancerModule configures the balancer module
 func ConfigureBalancerModule(context *clusterd.Context, clusterInfo *ClusterInfo, balancerModuleMode string) error {
-	// Set min compat client to luminous before enabling the balancer mode "upmap"
-	err := setMinCompatClientLuminous(context, clusterInfo)
+	minCompatClientVersion, err := desiredMinCompatClientVersion(clusterInfo, balancerModuleMode)
+	if err != nil {
+		return errors.Wrap(err, "failed to get minimum compatibility client version")
+	}
+
+	err = setMinCompatClient(context, clusterInfo, minCompatClientVersion)
 	if err != nil {
 		return errors.Wrap(err, "failed to set minimum compatibility client")
 	}
@@ -183,4 +188,18 @@ func ConfigureBalancerModule(context *clusterd.Context, clusterInfo *ClusterInfo
 	}
 
 	return nil
+}
+
+func desiredMinCompatClientVersion(clusterInfo *ClusterInfo, balancerModuleMode string) (string, error) {
+	// Set min compat client to luminous before enabling the balancer mode "upmap"
+	minCompatClientVersion := "luminous"
+	if balancerModuleMode == readBalancerMode || balancerModuleMode == upmapReadBalancerMode {
+		if !clusterInfo.CephVersion.IsAtLeast(cephver.CephVersion{Major: 19}) {
+			return "", errors.New("minimum ceph v19 (Squid) is required for upmap-read or read balancer modes")
+		}
+		// Set min compat client to reef before enabling the balancer mode "upmap-read" or "read"
+		minCompatClientVersion = "reef"
+	}
+
+	return minCompatClientVersion, nil
 }

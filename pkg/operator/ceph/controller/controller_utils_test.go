@@ -92,6 +92,74 @@ func TestSetCephCommandsTimeout(t *testing.T) {
 	assert.Equal(t, 1*time.Second, exec.CephCommandsTimeout)
 }
 
+func TestSetAllowLoopDevices(t *testing.T) {
+	SetAllowLoopDevices(map[string]string{})
+	assert.False(t, LoopDevicesAllowed())
+
+	SetAllowLoopDevices(map[string]string{"ROOK_CEPH_ALLOW_LOOP_DEVICES": "foo"})
+	assert.False(t, LoopDevicesAllowed())
+
+	SetAllowLoopDevices(map[string]string{"ROOK_CEPH_ALLOW_LOOP_DEVICES": "false"})
+	assert.False(t, LoopDevicesAllowed())
+
+	SetAllowLoopDevices(map[string]string{"ROOK_CEPH_ALLOW_LOOP_DEVICES": "true"})
+	assert.True(t, LoopDevicesAllowed())
+}
+
+func TestSetEnforceHostNetwork(t *testing.T) {
+	logger.Infof("testing default value for %v", enforceHostNetworkSettingName)
+	opConfig := map[string]string{}
+	SetEnforceHostNetwork(opConfig)
+	assert.False(t, EnforceHostNetwork())
+
+	// test invalid setting
+	var value string = "foo"
+	logger.Infof("testing invalid value'%v' for %v", value, enforceHostNetworkSettingName)
+	opConfig[enforceHostNetworkSettingName] = value
+	SetEnforceHostNetwork(opConfig)
+	assert.False(t, EnforceHostNetwork())
+
+	// test valid settings
+	value = "true"
+	logger.Infof("testing valid value'%v' for %v", value, enforceHostNetworkSettingName)
+	opConfig[enforceHostNetworkSettingName] = value
+	SetEnforceHostNetwork(opConfig)
+	assert.True(t, EnforceHostNetwork())
+
+	value = "false"
+	logger.Infof("testing valid value'%v' for %v", value, enforceHostNetworkSettingName)
+	opConfig[enforceHostNetworkSettingName] = value
+	SetEnforceHostNetwork(opConfig)
+	assert.False(t, EnforceHostNetwork())
+}
+
+func TestSetRevisionHistoryLimit(t *testing.T) {
+	opConfig := map[string]string{}
+	t.Run("ROOK_REVISION_HISTORY_LIMIT: test default value", func(t *testing.T) {
+		SetRevisionHistoryLimit(opConfig)
+		assert.Nil(t, RevisionHistoryLimit())
+	})
+
+	var value string = "foo"
+	t.Run("ROOK_REVISION_HISTORY_LIMIT: test invalid value 'foo'", func(t *testing.T) {
+		opConfig[revisionHistoryLimitSettingName] = value
+		SetRevisionHistoryLimit(opConfig)
+		assert.Nil(t, RevisionHistoryLimit())
+	})
+
+	t.Run("ROOK_REVISION_HISTORY_LIMIT: test empty string value", func(t *testing.T) {
+		value = ""
+		opConfig[revisionHistoryLimitSettingName] = value
+		SetRevisionHistoryLimit(opConfig)
+		assert.Nil(t, RevisionHistoryLimit())
+	})
+	t.Run("ROOK_REVISION_HISTORY_LIMIT:  test valig value '10'", func(t *testing.T) {
+		value = "10"
+		opConfig[revisionHistoryLimitSettingName] = value
+		SetRevisionHistoryLimit(opConfig)
+		assert.Equal(t, int32(10), *RevisionHistoryLimit())
+	})
+}
 func TestIsReadyToReconcile(t *testing.T) {
 	scheme := scheme.Scheme
 	scheme.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{})
@@ -125,6 +193,7 @@ func TestIsReadyToReconcile(t *testing.T) {
 				Name:              clusterName.Name,
 				Namespace:         clusterName.Namespace,
 				DeletionTimestamp: &metav1.Time{Time: time.Now()},
+				Finalizers:        []string{"test"},
 			},
 		}
 
@@ -162,6 +231,7 @@ func TestIsReadyToReconcile(t *testing.T) {
 				Name:              clusterName.Name,
 				Namespace:         clusterName.Namespace,
 				DeletionTimestamp: &metav1.Time{Time: time.Now()},
+				Finalizers:        []string{"test"},
 			},
 			Spec: cephv1.ClusterSpec{
 				CleanupPolicy: cephv1.CleanupPolicySpec{

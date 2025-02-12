@@ -11,18 +11,31 @@ on:
       - master
       - release-*
 
+# cancel the in-progress workflow when PR is refreshed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   codespell:
     name: codespell
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: codespell
-        uses: codespell-project/actions-codespell@master
+        uses: codespell-project/actions-codespell@406322ec52dd7b488e48c1c4b82e2a8b3a1bf630 # master
         with:
-          skip: .git,*.png,*.jpg,*.svg,*.sum
+          # LICENSE: skip file because codespell wants to flag complies, which we may want to flag
+          # in other places, so ignore the file itself assuming it is correct
+          # crds.yaml, resources.yaml: CRD files are fully generated from content we control (should
+          # be flagged elsewhere) and content we don't control (can't fix easily), so ignore
+          # *Dashboard.jjson: Grafana dashboards that are generated via exporting them from Grafana.
+          skip: .git,*.png,*.jpg,*.svg,*.sum,./LICENSE,./deploy/examples/crds.yaml,./deploy/charts/rook-ceph/templates/resources.yaml,./deploy/examples/csi-operator.yaml,*Dashboard.json
           # aks: Amazon Kubernetes Service
           # keyserver: flag to apt-key
           # atleast: codespell wants to flag any 'AtLeast' method
@@ -32,6 +45,16 @@ jobs:
           # te: udev persistent naming test in pkg/daemon/ceph/osd/daemon_test.go
           # parm: modinfo parameter
           # assigment: inherited from K8s TopologySpreadConstraints dependency
-          ignore_words_list: aks,keyserver,atleast,ser,ist,ba,iam,te,parm,assigment
+          # ro, RO: means read-only
+          ignore_words_list: aks,keyserver,atleast,ser,ist,ba,iam,te,parm,assigment,ro,RO,addin,NotIn
           check_filenames: true
           check_hidden: true
+  misspell:
+    name: misspell
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: misspell
+        uses: reviewdog/action-misspell@18ffb61effb93b47e332f185216be7e49592e7e1 # v1.26.1

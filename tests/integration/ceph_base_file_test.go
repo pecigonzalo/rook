@@ -17,11 +17,13 @@ limitations under the License.
 package integration
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"testing"
 	"time"
 
-	"github.com/rook/rook/pkg/daemon/ceph/client"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/tests/framework/clients"
@@ -30,13 +32,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	v1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const (
 	filePodName = "file-test"
 )
 
-func fileSystemCSICloneTest(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, storageClassName, systemNamespace string) {
+func fileSystemCSICloneTest(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, storageClassName, systemNamespace string) {
 	// create pvc and app
 	pvcSize := "1Gi"
 	pvcName := "parent-pvc"
@@ -110,7 +116,7 @@ func fileSystemCSICloneTest(helper *clients.TestClient, k8sh *utils.K8sHelper, s
 	assert.True(s.T(), k8sh.WaitUntilPVCIsDeleted(defaultNamespace, pvcName))
 }
 
-func fileSystemCSISnapshotTest(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, storageClassName, namespace string) {
+func fileSystemCSISnapshotTest(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, storageClassName, namespace string, testNFS bool) {
 	logger.Infof("install snapshot CRD")
 	err := k8sh.CreateSnapshotCRD()
 	require.NoError(s.T(), err)
@@ -136,7 +142,11 @@ func fileSystemCSISnapshotTest(helper *clients.TestClient, k8sh *utils.K8sHelper
 	snapshotDeletePolicy := "Delete"
 	snapshotClassName := "snapshot-testing"
 	logger.Infof("create snapshotclass")
-	err = helper.FSClient.CreateSnapshotClass(snapshotClassName, snapshotDeletePolicy, namespace)
+	if !testNFS {
+		err = helper.FSClient.CreateSnapshotClass(snapshotClassName, snapshotDeletePolicy, namespace)
+	} else {
+		err = helper.NFSClient.CreateSnapshotClass(snapshotClassName, snapshotDeletePolicy)
+	}
 	require.NoError(s.T(), err)
 	// create pvc and app
 	pvcSize := "1Gi"
@@ -165,11 +175,11 @@ func fileSystemCSISnapshotTest(helper *clients.TestClient, k8sh *utils.K8sHelper
 	pvcChecksum := strings.Fields(resp)
 	require.Equal(s.T(), len(pvcChecksum), 2)
 	// create a snapshot
-	snapshotName := "rbd-pvc-snapshot"
+	snapshotName := "fs-pvc-snapshot"
 	logger.Infof("create a snapshot from pvc")
 	err = helper.FSClient.CreateSnapshot(snapshotName, pvcName, snapshotClassName, defaultNamespace)
 	require.NoError(s.T(), err)
-	restorePVCName := "restore-block-pvc"
+	restorePVCName := "restore-fs-pvc"
 	// check snapshot is in ready state
 	ready, err := k8sh.CheckSnapshotISReadyToUse(snapshotName, defaultNamespace, 15)
 	require.NoError(s.T(), err)
@@ -227,15 +237,18 @@ func fileSystemCSISnapshotTest(helper *clients.TestClient, k8sh *utils.K8sHelper
 	assert.True(s.T(), k8sh.WaitUntilPVCIsDeleted(defaultNamespace, pvcName))
 
 	logger.Infof("delete snapshotclass")
-
-	err = helper.FSClient.DeleteSnapshotClass(snapshotClassName, snapshotDeletePolicy, namespace)
+	if !testNFS {
+		err = helper.FSClient.DeleteSnapshotClass(snapshotClassName, snapshotDeletePolicy, namespace)
+	} else {
+		err = helper.NFSClient.DeleteSnapshotClass(snapshotClassName, snapshotDeletePolicy)
+	}
 	require.NoError(s.T(), err)
 	logger.Infof("delete snapshot-controller")
 }
 
 // Smoke Test for File System Storage - Test check the following operations on Filesystem Storage in order
 // Create,Mount,Write,Read,Unmount and Delete.
-func runFileE2ETest(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, settings *installer.TestCephSettings, filesystemName string, preserveFilesystemOnDelete bool) {
+func runFileE2ETest(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, settings *installer.TestCephSettings, filesystemName string, preserveFilesystemOnDelete bool) {
 	defer fileTestDataCleanUp(helper, k8sh, s, filePodName, settings.Namespace, filesystemName)
 	logger.Infof("Running on Rook Cluster %s", settings.Namespace)
 	logger.Infof("File Storage End To End Integration Test - create, mount, write to, read from, and unmount")
@@ -257,14 +270,130 @@ func runFileE2ETest(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.S
 	err = writeAndReadToFilesystem(helper, k8sh, s, settings.Namespace, filePodName, "test_file")
 	assert.NoError(s.T(), err)
 
-	// Start the NFS daemons
-	testNFSDaemons(helper, k8sh, s, settings, filesystemName)
+	t := s.T()
+	ctx := context.TODO()
 
-	// Cleanup the filesystem and its clients
-	cleanupFilesystemConsumer(helper, k8sh, s, settings.Namespace, filePodName)
-	assert.NoError(s.T(), err)
-	downscaleMetadataServers(helper, k8sh, s, settings.Namespace, filesystemName)
-	cleanupFilesystem(helper, k8sh, s, settings.Namespace, filesystemName)
+	// TODO: there is a regression here where MDSes don't actually scale down, and this test
+	// wasn't catching it. Enabling this test causes the controller to enter into a new reconcile
+	// loop and makes the next phase of the test take much longer than it should, making it flaky.
+	// Rook issue https://github.com/rook/rook/issues/9857 is tracking this issue.
+	// t.Run("filesystem should be able to be scaled down", func(t *testing.T) {
+	// 	downscaleMetadataServers(helper, k8sh, t, settings.Namespace, filesystemName)
+	// })
+
+	subvolGroupName := "my-subvolume-group"
+	t.Run("install CephFilesystemSubVolumeGroup", func(t *testing.T) {
+		err = helper.FSClient.CreateSubvolumeGroup(filesystemName, subvolGroupName)
+		assert.NoError(t, err)
+	})
+
+	t.Run("delete CephFilesystem should be blocked by csi volumes and CephFilesystemSubVolumeGroup", func(t *testing.T) {
+		// NOTE: CephFilesystems do not set "Deleting" phase when they are deleting, so we can't
+		// rely on that here
+
+		err := k8sh.RookClientset.CephV1().CephFilesystems(settings.Namespace).Delete(
+			ctx, filesystemName, metav1.DeleteOptions{})
+		assert.NoError(t, err)
+
+		var cond *cephv1.Condition
+		err = wait.PollUntilContextTimeout(context.TODO(), 2*time.Second, 45*time.Second, true, func(context context.Context) (done bool, err error) {
+			logger.Infof("waiting for CephFilesystem %q in namespace %q to have condition %q",
+				filesystemName, settings.Namespace, cephv1.ConditionDeletionIsBlocked)
+			fs, err := k8sh.RookClientset.CephV1().CephFilesystems(settings.Namespace).Get(
+				ctx, filesystemName, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+
+			logger.Infof("conditions: %+v", fs.Status.Conditions)
+
+			cond = cephv1.FindStatusCondition(fs.Status.Conditions, cephv1.ConditionDeletionIsBlocked)
+			if cond != nil {
+				logger.Infof("CephFilesystem %q in namespace %q has condition %q",
+					filesystemName, settings.Namespace, cephv1.ConditionDeletionIsBlocked)
+				return true, nil
+			}
+
+			return false, nil
+		})
+		assert.NoError(t, err)
+
+		if cond == nil {
+			return
+		}
+		logger.Infof("verifying CephFilesystem %q condition %q is correct: %+v",
+			filesystemName, cephv1.ConditionDeletionIsBlocked, cond)
+
+		assert.Equal(t, v1.ConditionTrue, cond.Status)
+		assert.Equal(t, cephv1.ObjectHasDependentsReason, cond.Reason)
+		// the CephFilesystemSubVolumeGroup and the "csi" subvolumegroup should both block deletion
+		assert.Contains(t, cond.Message, "CephFilesystemSubVolumeGroups")
+		assert.Contains(t, cond.Message, subvolGroupName)
+		assert.Contains(t, cond.Message, "filesystem subvolume groups that contain subvolumes")
+		assert.Contains(t, cond.Message, "csi")
+	})
+
+	t.Run("deleting CephFilesystemSubVolumeGroup should partially unblock CephFilesystem deletion", func(t *testing.T) {
+		err = helper.FSClient.DeleteSubvolumeGroup(filesystemName, subvolGroupName)
+		assert.NoError(t, err)
+
+		var cond *cephv1.Condition
+		err = wait.PollUntilContextTimeout(context.TODO(), 2*time.Second, 18*time.Second, true, func(context context.Context) (done bool, err error) {
+			logger.Infof("waiting for CephFilesystem %q in namespace %q no longer be blocked by CephFilesystemSubVolumeGroups",
+				filesystemName, settings.Namespace)
+			fs, err := k8sh.RookClientset.CephV1().CephFilesystems(settings.Namespace).Get(
+				ctx, filesystemName, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+
+			cond = cephv1.FindStatusCondition(fs.Status.Conditions, cephv1.ConditionDeletionIsBlocked)
+			if cond == nil {
+				logger.Warningf("could not find condition %q on CephFilesystem %q", cephv1.ConditionDeletionIsBlocked, filesystemName)
+				return false, nil
+			}
+
+			if !strings.Contains(cond.Message, "CephFilesystemSubVolumeGroup") {
+				logger.Infof("CephFilesystem %q deletion is no longer blocked by CephFilesystemSubVolumeGroups", filesystemName)
+				return true, nil
+			}
+
+			return false, nil
+		})
+		assert.NoError(t, err)
+
+		if cond == nil {
+			return
+		}
+		logger.Infof("verifying CephFilesystem %q condition %q is correct: %+v",
+			filesystemName, cephv1.ConditionDeletionIsBlocked, cond)
+
+		assert.Equal(t, v1.ConditionTrue, cond.Status)
+		assert.Equal(t, cephv1.ObjectHasDependentsReason, cond.Reason)
+		// only the raw subvolumegroups should block deletion
+		assert.Contains(t, cond.Message, "filesystem subvolume groups that contain subvolumes")
+		assert.Contains(t, cond.Message, "csi")
+	})
+
+	t.Run("deleting filesystem consumer pod+pvc should fully unblock CephFilesystem deletion", func(t *testing.T) {
+		// Cleanup the filesystem and its clients
+		cleanupFilesystemConsumer(helper, k8sh, s, settings.Namespace, filePodName)
+
+		err = wait.PollUntilContextTimeout(context.TODO(), 3*time.Second, 30*time.Second, true, func(context context.Context) (done bool, err error) {
+			logger.Infof("waiting for CephFilesystem %q in namespace %q to be deleted", filesystemName, settings.Namespace)
+
+			_, err = k8sh.RookClientset.CephV1().CephFilesystems(settings.Namespace).Get(
+				ctx, filesystemName, metav1.GetOptions{})
+			if err != nil && kerrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, nil
+		})
+
+		logger.Infof("CephFilesystem %q in namespace %q was deleted successfully", filesystemName, settings.Namespace)
+	})
+
 	err = helper.FSClient.DeleteStorageClass(storageClassName)
 	assertNoErrorUnlessNotFound(s, err)
 
@@ -279,16 +408,7 @@ func runFileE2ETest(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.S
 	}
 }
 
-func testNFSDaemons(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, settings *installer.TestCephSettings, filesystemName string) {
-	name := "my-nfs"
-	err := helper.NFSClient.Create(settings.Namespace, name, 2)
-	require.Nil(s.T(), err)
-
-	err = helper.NFSClient.Delete(settings.Namespace, name)
-	assert.Nil(s.T(), err)
-}
-
-func createFilesystemConsumerPod(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, settings *installer.TestCephSettings, filesystemName, storageClassName string) {
+func createFilesystemConsumerPod(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, settings *installer.TestCephSettings, filesystemName, storageClassName string) {
 	err := createPodWithFilesystem(k8sh, s, settings, filePodName, filesystemName, storageClassName, false)
 	require.NoError(s.T(), err)
 	filePodRunning := k8sh.IsPodRunning(filePodName, settings.Namespace)
@@ -296,7 +416,7 @@ func createFilesystemConsumerPod(helper *clients.TestClient, k8sh *utils.K8sHelp
 	logger.Infof("File system mounted successfully")
 }
 
-func writeAndReadToFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, namespace, podName, filename string) error {
+func writeAndReadToFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, namespace, podName, filename string) error {
 	logger.Infof("Write to file system")
 	message := "Test Data for file system storage"
 	if err := k8sh.WriteToPod(namespace, podName, filename, message); err != nil {
@@ -306,13 +426,13 @@ func writeAndReadToFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper,
 	return k8sh.ReadFromPod(namespace, podName, filename, message)
 }
 
-func downscaleMetadataServers(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, namespace, fsName string) {
-	logger.Infof("downscaling file system metadata servers")
-	err := helper.FSClient.ScaleDown(fsName, namespace)
-	require.Nil(s.T(), err)
-}
+// func downscaleMetadataServers(helper *clients.TestClient, k8sh *utils.K8sHelper, t *testing.T, namespace, fsName string) {
+// 	logger.Infof("downscaling file system metadata servers")
+// 	err := helper.FSClient.ScaleDown(fsName, namespace)
+// 	require.Nil(t, err)
+// }
 
-func cleanupFilesystemConsumer(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, namespace string, podName string) {
+func cleanupFilesystemConsumer(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, namespace string, podName string) {
 	logger.Infof("Delete file System consumer")
 	err := k8sh.DeletePod(namespace, podName)
 	assert.Nil(s.T(), err)
@@ -322,11 +442,19 @@ func cleanupFilesystemConsumer(helper *clients.TestClient, k8sh *utils.K8sHelper
 	}
 	err = helper.FSClient.DeletePVC(namespace, podName)
 	assertNoErrorUnlessNotFound(s, err)
+	isdeleted := k8sh.WaitUntilPVCIsDeleted(namespace, podName)
+	if !isdeleted {
+		assert.Fail(s.T(), fmt.Sprintf("Failed to delete PVC %q", podName))
+	}
+	isPVListZero := k8sh.WaitUntilZeroPVs()
+	if !isPVListZero {
+		assert.Fail(s.T(), "PV list is not zero")
+	}
 	logger.Infof("File system consumer deleted")
 }
 
 // cleanupFilesystem cleans up the filesystem and checks if all mds pods are terminated before continuing
-func cleanupFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, namespace string, filesystemName string) {
+func cleanupFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, namespace string, filesystemName string) {
 	logger.Infof("Deleting file system")
 	err := helper.FSClient.Delete(filesystemName, namespace)
 	assert.Nil(s.T(), err)
@@ -334,7 +462,7 @@ func cleanupFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s suit
 }
 
 // Test File System Creation on Rook that was installed on a custom namespace i.e. Namespace != "rook" and delete it again
-func runFileE2ETestLite(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, settings *installer.TestCephSettings, filesystemName string) {
+func runFileE2ETestLite(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, settings *installer.TestCephSettings, filesystemName string) {
 	logger.Infof("File Storage End to End Integration Test - create Filesystem and make sure mds pod is running")
 	logger.Infof("Running on Rook Cluster %s", settings.Namespace)
 	activeCount := 1
@@ -344,19 +472,15 @@ func runFileE2ETestLite(helper *clients.TestClient, k8sh *utils.K8sHelper, s sui
 	err := helper.FSClient.CreateStorageClass(filesystemName, settings.OperatorNamespace, settings.Namespace, storageClassName)
 	assert.NoError(s.T(), err)
 	assert.NoError(s.T(), err)
-	if !skipSnapshotTest(k8sh) {
-		fileSystemCSISnapshotTest(helper, k8sh, s, storageClassName, settings.Namespace)
-	}
+	fileSystemCSISnapshotTest(helper, k8sh, s, storageClassName, settings.Namespace, false)
+	fileSystemCSICloneTest(helper, k8sh, s, storageClassName, settings.Namespace)
 
-	if !skipCloneTest(k8sh) {
-		fileSystemCSICloneTest(helper, k8sh, s, storageClassName, settings.Namespace)
-	}
 	cleanupFilesystem(helper, k8sh, s, settings.Namespace, filesystemName)
 	err = helper.FSClient.DeleteStorageClass(storageClassName)
 	assertNoErrorUnlessNotFound(s, err)
 }
 
-func createFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, settings *installer.TestCephSettings, filesystemName string, activeCount int) {
+func createFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, settings *installer.TestCephSettings, filesystemName string, activeCount int) {
 	logger.Infof("Create file System")
 	fscErr := helper.FSClient.Create(filesystemName, settings.Namespace, activeCount)
 	require.Nil(s.T(), fscErr)
@@ -381,7 +505,7 @@ func createFilesystem(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite
 	require.Equal(s.T(), 1, len(filesystemList), "There should be one shared file system present")
 }
 
-func fileTestDataCleanUp(helper *clients.TestClient, k8sh *utils.K8sHelper, s suite.Suite, podName string, namespace string, filesystemName string) {
+func fileTestDataCleanUp(helper *clients.TestClient, k8sh *utils.K8sHelper, s *suite.Suite, podName string, namespace string, filesystemName string) {
 	logger.Infof("Cleaning up file system")
 	err := k8sh.DeletePod(namespace, podName)
 	assert.NoError(s.T(), err)
@@ -389,7 +513,7 @@ func fileTestDataCleanUp(helper *clients.TestClient, k8sh *utils.K8sHelper, s su
 	assert.NoError(s.T(), err)
 }
 
-func createPodWithFilesystem(k8sh *utils.K8sHelper, s suite.Suite, settings *installer.TestCephSettings, podName, filesystemName, storageClassName string, mountUser bool) error {
+func createPodWithFilesystem(k8sh *utils.K8sHelper, s *suite.Suite, settings *installer.TestCephSettings, podName, filesystemName, storageClassName string, mountUser bool) error {
 	testPodManifest := getFilesystemCSITestPod(settings, podName, storageClassName)
 	if err := k8sh.ResourceOperation("create", testPodManifest); err != nil {
 		return fmt.Errorf("failed to create pod -- %s. %+v", testPodManifest, err)
@@ -440,7 +564,7 @@ spec:
 `
 }
 
-func waitForFilesystemActive(k8sh *utils.K8sHelper, clusterInfo *client.ClusterInfo, filesystemName string) error {
+func waitForFilesystemActive(k8sh *utils.K8sHelper, clusterInfo *cephclient.ClusterInfo, filesystemName string) error {
 	command, args := cephclient.FinalizeCephCommandArgs("ceph", clusterInfo, []string{"fs", "status", filesystemName}, k8sh.MakeContext().ConfigDir)
 	var stat string
 	var err error

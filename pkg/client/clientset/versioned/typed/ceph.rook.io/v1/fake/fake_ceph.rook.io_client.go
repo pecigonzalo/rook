@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -42,6 +42,10 @@ func (c *FakeCephV1) CephBucketNotifications(namespace string) v1.CephBucketNoti
 
 func (c *FakeCephV1) CephBucketTopics(namespace string) v1.CephBucketTopicInterface {
 	return &FakeCephBucketTopics{c, namespace}
+}
+
+func (c *FakeCephV1) CephCOSIDrivers(namespace string) v1.CephCOSIDriverInterface {
+	return &FakeCephCOSIDrivers{c, namespace}
 }
 
 func (c *FakeCephV1) CephClients(namespace string) v1.CephClientInterface {

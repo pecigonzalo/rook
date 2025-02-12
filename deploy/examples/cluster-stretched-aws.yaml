@@ -14,6 +14,7 @@ metadata:
   name: rook-ceph
   namespace: rook-ceph # namespace:cluster
 spec:
+  # If there are multiple clusters, the directory must be unique for each cluster.
   dataDirHostPath: /var/lib/rook
   mon:
     # Five mons must be created for stretch mode
@@ -22,14 +23,14 @@ spec:
     stretchCluster:
       # The ceph failure domain will be extracted from the label, which by default is the zone. The nodes running OSDs must have
       # this label in order for the OSDs to be configured in the correct topology. For topology labels, see
-      # https://rook.github.io/docs/rook/latest/ceph-cluster-crd.html#osd-topology.
+      # https://rook.io/docs/rook/latest/CRDs/ceph-cluster-crd/#osd-topology.
       failureDomainLabel: topology.kubernetes.io/zone
       # The sub failure domain is the secondary level at which the data will be placed to maintain data durability and availability.
-      # The default is "host", which means that each OSD must be on a different node and you would need at least two nodes per zone.
-      # If the subFailureDomain is set to "osd", the OSDs would be allowed anywhere in the same zone including on the same node.
+      # Since OSDs are portable, the default is "osd", which means that you would need at least two nodes per zone.
+      # If the subFailureDomain is set to "host", the OSDs should not be portable.
       # If set to "rack" or some other intermediate failure domain, those labels would also need to be set on the nodes where
       # the osds are started.
-      subFailureDomain: host
+      subFailureDomain: osd
       zones:
         - name: us-east-2a
           arbiter: true
@@ -37,15 +38,14 @@ spec:
         - name: us-east-2c
     volumeClaimTemplate:
       spec:
-        storageClassName: gp2
+        storageClassName: gp2-csi
         resources:
           requests:
             storage: 10Gi
   mgr:
     count: 2
   cephVersion:
-    # Stretch cluster support upstream is only available starting in Ceph Pacific
-    image: quay.io/ceph/ceph:v16.2.7
+    image: quay.io/ceph/ceph:v19.2.0
     allowUnsupported: true
   skipUpgradeChecks: false
   continueUpgradeAfterChecksEvenIfNotHealthy: false
@@ -86,7 +86,7 @@ spec:
               resources:
                 requests:
                   storage: 10Gi
-              storageClassName: gp2
+              storageClassName: gp2-csi
               volumeMode: Block
               accessModes:
                 - ReadWriteOnce
@@ -119,18 +119,39 @@ spec:
               resources:
                 requests:
                   storage: 10Gi
-              storageClassName: gp2
+              storageClassName: gp2-csi
               volumeMode: Block
               accessModes:
                 - ReadWriteOnce
   placement:
     # The arbiter mon can have its own placement settings that will be different from the mons.
     # If the arbiter section is not included in the placement, the arbiter will use the same placement
-    # settings as other mons. In this example, the arbiter has a toleration to run on a master node.
+    # settings as other mons. In this example, the arbiter has a toleration to run on a control-plane node.
     arbiter:
       tolerations:
-        - key: node-role.kubernetes.io/master
+        # kubernetes v1.24 clusters would need the taint `node-role.kubernetes.io/control-plane`
+        # configuration. For earlier versions you may use `node-role.kubernetes.io/master` if
+        # available in your cluster.
+        - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
+  priorityClassNames:
+    mon: system-node-critical
+    osd: system-node-critical
+    mgr: system-cluster-critical
   disruptionManagement:
     managePodBudgets: true
+---
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: builtin-mgr
+  namespace: rook-ceph # namespace:cluster
+spec:
+  name: .mgr
+  failureDomain: zone
+  replicated:
+    size: 4
+    requireSafeReplicaSize: true
+    replicasPerFailureDomain: 2
+    subFailureDomain: osd

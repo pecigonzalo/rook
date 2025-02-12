@@ -21,6 +21,7 @@ import (
 	"context"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	discoverDaemon "github.com/rook/rook/pkg/daemon/discover"
@@ -28,23 +29,48 @@ import (
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
+func shouldReconcileChangedNode(objOld, objNew *corev1.Node) bool {
+	// do not watch node if only resourceversion got changed
+	resourceQtyComparer := cmpopts.IgnoreFields(v1.ObjectMeta{}, "ResourceVersion")
+	diff := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+
+	// do not watch node if only LastHeartbeatTime got changed
+	resourceQtyComparer = cmpopts.IgnoreFields(corev1.NodeCondition{}, "LastHeartbeatTime")
+	diff1 := cmp.Diff(objOld.Spec, objNew.Spec, resourceQtyComparer)
+
+	if diff == "" && diff1 == "" {
+		return false
+	}
+	return true
+}
+
 // predicateForNodeWatcher is the predicate function to trigger reconcile on Node events
-func predicateForNodeWatcher(ctx context.Context, client client.Client, context *clusterd.Context) predicate.Funcs {
+func predicateForNodeWatcher(ctx context.Context, client client.Client, context *clusterd.Context, opNamespace string) predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			clientCluster := newClientCluster(client, e.Object.GetNamespace(), context)
-			return clientCluster.onK8sNode(ctx, e.Object)
+			return clientCluster.onK8sNode(ctx, e.Object, opNamespace)
 		},
 
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			clientCluster := newClientCluster(client, e.ObjectNew.GetNamespace(), context)
-			return clientCluster.onK8sNode(ctx, e.ObjectNew)
+			if objOld, ok := e.ObjectOld.(*corev1.Node); ok {
+				if objNew, ok := e.ObjectNew.(*corev1.Node); ok {
+					if !shouldReconcileChangedNode(objOld, objNew) {
+						return false
+					}
+
+					clientCluster := newClientCluster(client, e.ObjectNew.GetNamespace(), context)
+					return clientCluster.onK8sNode(ctx, e.ObjectNew, opNamespace)
+				}
+			}
+			return false
 		},
 
 		DeleteFunc: func(e event.DeleteEvent) bool {
@@ -63,7 +89,6 @@ func predicateForHotPlugCMWatcher(client client.Client) predicate.Funcs {
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			isHotPlugCM := isHotPlugCM(e.ObjectNew)
 			if !isHotPlugCM {
-				logger.Debugf("hot-plug cm watcher: only reconcile on hot plug cm changes, this %q cm is handled by another watcher", e.ObjectNew.GetName())
 				return false
 			}
 

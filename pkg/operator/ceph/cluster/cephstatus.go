@@ -166,19 +166,14 @@ func (c *cephStatusChecker) configureHealthSettings(status cephclient.CephStatus
 	if _, ok := status.Health.Checks["AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED"]; ok {
 		if _, ok := status.Health.Checks["AUTH_INSECURE_GLOBAL_ID_RECLAIM"]; !ok {
 			logger.Info("Disabling the insecure global ID as no legacy clients are currently connected. If you still require the insecure connections, see the CVE to suppress the health warning and re-enable the insecure connections. https://docs.ceph.com/en/latest/security/CVE-2021-20288/")
-			monStore := config.GetMonStore(c.context, c.clusterInfo)
-			if err := monStore.Set("mon", "auth_allow_insecure_global_id_reclaim", "false"); err != nil {
-				logger.Warningf("failed to disable the insecure global ID. %v", err)
-			} else {
-				logger.Info("insecure global ID is now disabled")
-			}
+			config.DisableInsecureGlobalID(c.context, c.clusterInfo)
 		} else {
 			logger.Warning("insecure clients are connected to the cluster, to resolve the AUTH_INSECURE_GLOBAL_ID_RECLAIM health warning please refer to the upgrade guide to ensure all Ceph daemons are updated.")
 		}
 	}
 }
 
-// updateStatus updates an object with a given status
+// updateCephStatus updates an object with a given status
 func (c *cephStatusChecker) updateCephStatus(status *cephclient.CephStatus, condition cephv1.ConditionType, reason cephv1.ConditionReason, message string, conditionStatus v1.ConditionStatus) {
 	clusterName := c.clusterInfo.NamespacedName()
 	cephCluster, err := c.context.RookClientset.CephV1().CephClusters(clusterName.Namespace).Get(c.clusterInfo.Context, clusterName.Name, metav1.GetOptions{})
@@ -293,7 +288,7 @@ func cephStatusOnError(errorMessage string) *cephclient.CephStatus {
 	}
 }
 
-// forceDeleteStuckPodsOnNotReadyNodes lists all the nodes that are in NotReady state and
+// forceDeleteStuckRookPodsOnNotReadyNodes lists all the nodes that are in NotReady state and
 // gets all the pods on the failed node and force delete the pods stuck in terminating state.
 func (c *cephStatusChecker) forceDeleteStuckRookPodsOnNotReadyNodes(ctx context.Context) error {
 	nodes, err := k8sutil.GetNotReadyKubernetesNodes(ctx, c.context.Clientset)
@@ -321,6 +316,8 @@ func (c *cephStatusChecker) getRookPodsOnNode(node string) ([]v1.Pod, error) {
 		"csi-rbdplugin",
 		"csi-cephfsplugin-provisioner",
 		"csi-cephfsplugin",
+		"csi-nfsplugin-provisioner",
+		"csi-nfsplugin",
 		"rook-ceph-operator",
 		"rook-ceph-mon",
 		"rook-ceph-osd",
@@ -328,6 +325,7 @@ func (c *cephStatusChecker) getRookPodsOnNode(node string) ([]v1.Pod, error) {
 		"rook-ceph-mgr",
 		"rook-ceph-mds",
 		"rook-ceph-rgw",
+		"rook-ceph-exporter",
 	}
 	podsOnNode := []v1.Pod{}
 	listOpts := metav1.ListOptions{

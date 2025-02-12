@@ -27,20 +27,17 @@ import (
 	v1 "k8s.io/client-go/kubernetes/typed/storage/v1"
 )
 
-type csiDriver interface {
-	createCSIDriverInfo(ctx context.Context, clientset kubernetes.Interface, name, fsGroupPolicy string) error
-	reCreateCSIDriverInfo(ctx context.Context) error
-	deleteCSIDriverInfo(ctx context.Context, clientset kubernetes.Interface, name string) error
-}
-
 type v1CsiDriver struct {
 	csiDriver *v1k8scsi.CSIDriver
 	csiClient v1.CSIDriverInterface
 }
 
 // createCSIDriverInfo Registers CSI driver by creating a CSIDriver object
-func (d v1CsiDriver) createCSIDriverInfo(ctx context.Context, clientset kubernetes.Interface, name, fsGroupPolicy string) error {
-	attach := true
+func (d v1CsiDriver) createCSIDriverInfo(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	name, fsGroupPolicy string,
+	attachRequired, seLinuxMountRequired bool) error {
 	mountInfo := false
 	// Create CSIDriver object
 	csiDriver := &v1k8scsi.CSIDriver{
@@ -48,9 +45,13 @@ func (d v1CsiDriver) createCSIDriverInfo(ctx context.Context, clientset kubernet
 			Name: name,
 		},
 		Spec: v1k8scsi.CSIDriverSpec{
-			AttachRequired: &attach,
+			AttachRequired: &attachRequired,
 			PodInfoOnMount: &mountInfo,
 		},
+	}
+	if seLinuxMountRequired {
+		selinuxMount := true
+		csiDriver.Spec.SELinuxMount = &selinuxMount
 	}
 	if fsGroupPolicy != "" {
 		policy := v1k8scsi.FSGroupPolicy(fsGroupPolicy)
@@ -69,9 +70,9 @@ func (d v1CsiDriver) createCSIDriverInfo(ctx context.Context, clientset kubernet
 		return err
 	}
 
-	// As FSGroupPolicy field is immutable, should be set only during create time.
-	// if the request is to change the FSGroupPolicy, we are deleting the CSIDriver object and creating it.
-	if driver.Spec.FSGroupPolicy != nil && csiDriver.Spec.FSGroupPolicy != nil && *driver.Spec.FSGroupPolicy != *csiDriver.Spec.FSGroupPolicy {
+	// As FSGroupPolicy and AttachRequired fields are immutable, should be set only during create time.
+	// if the request is to change the FSGroupPolicy or AttachRequired, we are deleting the CSIDriver object and creating it.
+	if (driver.Spec.FSGroupPolicy != nil && csiDriver.Spec.FSGroupPolicy != nil && *driver.Spec.FSGroupPolicy != *csiDriver.Spec.FSGroupPolicy) || *driver.Spec.AttachRequired != *csiDriver.Spec.AttachRequired {
 		d.csiClient = csidrivers
 		d.csiDriver = csiDriver
 		return d.reCreateCSIDriverInfo(ctx)

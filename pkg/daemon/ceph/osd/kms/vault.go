@@ -18,7 +18,6 @@ package kms
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -48,7 +47,7 @@ var (
 
 // Used for unit tests mocking too as well as production code
 var (
-	createTmpFile      = ioutil.TempFile
+	createTmpFile      = os.CreateTemp
 	getRemoveCertFiles = getRemoveCertFilesFunc
 )
 
@@ -148,7 +147,7 @@ func configTLS(ctx context.Context, clusterdContext *clusterd.Context, namespace
 			}
 
 			// Write into a file
-			err = ioutil.WriteFile(file.Name(), secret.Data[tlsSecretKeyToCheck(tlsOption)], 0444)
+			err = os.WriteFile(file.Name(), secret.Data[tlsSecretKeyToCheck(tlsOption)], 0400)
 			if err != nil {
 				return nil, removeCertFiles, errors.Wrapf(err, "failed to write k8s secret %q content to a file", tlsSecretName)
 			}
@@ -187,50 +186,6 @@ func getRemoveCertFilesFunc(filesToRemove []*os.File) removeCertFilesFunction {
 	})
 }
 
-func put(v secrets.Secrets, secretName, secretValue string, keyContext map[string]string) error {
-	// First we must see if the key entry already exists, if it does we do nothing
-	key, err := get(v, secretName, keyContext)
-	if err != nil && err != secrets.ErrInvalidSecretId {
-		return errors.Wrapf(err, "failed to get secret %q in vault", secretName)
-	}
-	if key != "" {
-		logger.Debugf("key %q already exists in vault!", secretName)
-		return nil
-	}
-
-	// Build Secret
-	data := make(map[string]interface{})
-	data[secretName] = secretValue
-
-	//nolint:gosec // Write the encryption key in Vault
-	err = v.PutSecret(secretName, data, keyContext)
-	if err != nil {
-		return errors.Wrapf(err, "failed to put secret %q in vault", secretName)
-	}
-
-	return nil
-}
-
-func get(v secrets.Secrets, secretName string, keyContext map[string]string) (string, error) {
-	//nolint:gosec // Write the encryption key in Vault
-	s, err := v.GetSecret(secretName, keyContext)
-	if err != nil {
-		return "", err
-	}
-
-	return s[secretName].(string), nil
-}
-
-func deleteSecret(v secrets.Secrets, secretName string, keyContext map[string]string) error {
-	//nolint:gosec // Write the encryption key in Vault
-	err := v.DeleteSecret(secretName, keyContext)
-	if err != nil {
-		return errors.Wrapf(err, "failed to delete secret %q in vault", secretName)
-	}
-
-	return nil
-}
-
 func buildVaultKeyContext(config map[string]string) map[string]string {
 	// Key context is just the Vault namespace, available in the enterprise version only
 	keyContext := map[string]string{secrets.KeyVaultNamespace: config[api.EnvVaultNamespace]}
@@ -267,7 +222,7 @@ func validateVaultConnectionDetails(ctx context.Context, clusterdContext *cluste
 			// Fetch the secret
 			s, err := clusterdContext.Clientset.CoreV1().Secrets(ns).Get(ctx, tlsSecretName, v1.GetOptions{})
 			if err != nil {
-				return errors.Errorf("failed to find TLS connection details k8s secret %q", tlsSecretName)
+				return errors.Wrapf(err, "failed to find TLS connection details k8s secret %q", tlsSecretName)
 			}
 
 			// Check the Secret key and its content

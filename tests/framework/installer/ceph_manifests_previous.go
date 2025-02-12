@@ -24,7 +24,7 @@ import (
 
 const (
 	// The version from which the upgrade test will start
-	Version1_8 = "v1.8.6"
+	Version1_15 = "v1.15.6"
 )
 
 // CephManifestsPreviousVersion wraps rook yaml definitions
@@ -39,6 +39,10 @@ func (m *CephManifestsPreviousVersion) Settings() *TestCephSettings {
 
 func (m *CephManifestsPreviousVersion) GetCRDs(k8shelper *utils.K8sHelper) string {
 	return m.settings.readManifestFromGitHub("crds.yaml")
+}
+
+func (m *CephManifestsPreviousVersion) GetCSINFSRBAC() string {
+	return m.settings.readManifestFromGitHub("/csi/nfs/rbac.yaml")
 }
 
 // GetRookOperator returns rook Operator manifest
@@ -105,6 +109,14 @@ func (m *CephManifestsPreviousVersion) GetFileStorageClass(fsName, storageClassN
 	return m.latest.GetFileStorageClass(fsName, storageClassName)
 }
 
+func (m *CephManifestsPreviousVersion) GetNFSStorageClass(fsName, nfsClusterName, server, storageClassName string) string {
+	return m.latest.GetNFSStorageClass(fsName, nfsClusterName, server, storageClassName)
+}
+
+func (m *CephManifestsPreviousVersion) GetNFSSnapshotClass(fsName, snapshotClassName string) string {
+	return m.latest.GetNFSSnapshotClass(fsName, snapshotClassName)
+}
+
 // GetFilesystem returns the manifest to create a Rook filesystem resource with the given config.
 func (m *CephManifestsPreviousVersion) GetFilesystem(name string, activeCount int) string {
 	return m.latest.GetFilesystem(name, activeCount)
@@ -119,35 +131,38 @@ func (m *CephManifestsPreviousVersion) GetNFSPool() string {
 	return m.latest.GetNFSPool()
 }
 
-func (m *CephManifestsPreviousVersion) GetObjectStore(name string, replicaCount, port int, tlsEnable bool) string {
-	return m.latest.GetObjectStore(name, replicaCount, port, tlsEnable)
+func (m *CephManifestsPreviousVersion) GetObjectStore(name string, replicaCount, port int, tlsEnable bool, swiftAndKeystone bool) string {
+	if swiftAndKeystone {
+		panic("Previous version does not support swift or keystone")
+	}
+	return m.latest.GetObjectStore(name, replicaCount, port, tlsEnable, false)
 }
 
 func (m *CephManifestsPreviousVersion) GetObjectStoreUser(name, displayName, store, usercaps, maxsize string, maxbuckets, maxobjects int) string {
 	return m.latest.GetObjectStoreUser(name, displayName, store, usercaps, maxsize, maxbuckets, maxobjects)
 }
 
-//GetBucketStorageClass returns the manifest to create object bucket
+// GetBucketStorageClass returns the manifest to create object bucket
 func (m *CephManifestsPreviousVersion) GetBucketStorageClass(storeName, storageClassName, reclaimPolicy string) string {
 	return m.latest.GetBucketStorageClass(storeName, storageClassName, reclaimPolicy)
 }
 
-//GetOBC returns the manifest to create object bucket claim
+// GetOBC returns the manifest to create object bucket claim
 func (m *CephManifestsPreviousVersion) GetOBC(claimName, storageClassName, objectBucketName, maxObject string, varBucketName bool) string {
 	return m.latest.GetOBC(claimName, storageClassName, objectBucketName, maxObject, varBucketName)
 }
 
-//GetOBCNotification returns the manifest to create object bucket claim
+// GetOBCNotification returns the manifest to create object bucket claim
 func (m *CephManifestsPreviousVersion) GetOBCNotification(claimName, storageClassName, objectBucketName, notificationName string, varBucketName bool) string {
 	return m.latest.GetOBCNotification(claimName, storageClassName, objectBucketName, notificationName, varBucketName)
 }
 
-//GetBucketNotification returns the manifest to create ceph bucket notification
+// GetBucketNotification returns the manifest to create ceph bucket notification
 func (m *CephManifestsPreviousVersion) GetBucketNotification(notificationName, topicName string) string {
 	return m.latest.GetBucketNotification(notificationName, topicName)
 }
 
-//GetBucketTopic returns the manifest to create ceph bucket topic
+// GetBucketTopic returns the manifest to create ceph bucket topic
 func (m *CephManifestsPreviousVersion) GetBucketTopic(topicName, storeName, httpEndpointService string) string {
 	return m.latest.GetBucketTopic(topicName, storeName, httpEndpointService)
 }
@@ -163,4 +178,20 @@ func (m *CephManifestsPreviousVersion) GetExternalCephCluster() string {
 // GetRBDMirror returns the manifest to create a Rook Ceph RBD Mirror resource with the given config.
 func (m *CephManifestsPreviousVersion) GetRBDMirror(name string, count int) string {
 	return m.latest.GetRBDMirror(name, count)
+}
+
+func (m *CephManifestsPreviousVersion) GetFilesystemSubvolumeGroup(fsName, groupName string) string {
+	return m.latest.GetFilesystemSubvolumeGroup(fsName, groupName)
+}
+
+func (m *CephManifestsPreviousVersion) GetCOSIDriver() string {
+	return m.latest.GetCOSIDriver()
+}
+
+func (m *CephManifestsPreviousVersion) GetBucketClass(name, objectStoreUserSecretName, deletionPolicy string) string {
+	return m.latest.GetBucketClass(name, objectStoreUserSecretName, deletionPolicy)
+}
+
+func (m *CephManifestsPreviousVersion) GetBucketClaim(name, bucketClassName string) string {
+	return m.latest.GetBucketClaim(name, bucketClassName)
 }

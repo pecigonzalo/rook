@@ -17,6 +17,7 @@ limitations under the License.
 package clusterdisruption
 
 import (
+	ctx "context"
 	"reflect"
 
 	"github.com/rook/rook/pkg/operator/ceph/disruption/controllerconfig"
@@ -30,11 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"github.com/rook/rook/pkg/operator/k8sutil"
 	policyv1 "k8s.io/api/policy/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -77,14 +75,9 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 	}
 
 	// Watch for CephClusters
-	err = c.Watch(&source.Kind{Type: &cephv1.CephCluster{}}, &handler.EnqueueRequestForObject{}, cephClusterPredicate)
+	err = c.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephCluster{}, &handler.EnqueueRequestForObject{}, cephClusterPredicate))
 	if err != nil {
 		return err
-	}
-
-	usePDBV1Beta1, err := k8sutil.UsePDBV1Beta1Version(reconcileClusterDisruption.context.ClusterdContext.Clientset)
-	if err != nil {
-		return errors.Wrap(err, "failed to fetch pdb version")
 	}
 
 	// Only reconcile for PDB update event when allowed disruptions for the main OSD PDB is 0.
@@ -95,13 +88,6 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 			return false
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			if usePDBV1Beta1 {
-				pdb, ok := e.ObjectNew.DeepCopyObject().(*policyv1beta1.PodDisruptionBudget)
-				if !ok {
-					return false
-				}
-				return pdb.Name == osdPDBAppName && pdb.Status.DisruptionsAllowed == 0
-			}
 			pdb, ok := e.ObjectNew.DeepCopyObject().(*policyv1.PodDisruptionBudget)
 			if !ok {
 				return false
@@ -115,30 +101,9 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 	}
 
 	// Watch for main PodDisruptionBudget and enqueue the CephCluster in the namespace
-	if usePDBV1Beta1 {
-		err = c.Watch(
-			&source.Kind{Type: &policyv1beta1.PodDisruptionBudget{}},
-			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(obj client.Object) []reconcile.Request {
-				pdb, ok := obj.(*policyv1beta1.PodDisruptionBudget)
-				if !ok {
-					// Not a pdb, returning empty
-					logger.Error("PDB handler received non-PDB")
-					return []reconcile.Request{}
-				}
-				namespace := pdb.GetNamespace()
-				req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
-				return []reconcile.Request{req}
-			}),
-			),
-			pdbPredicate,
-		)
-		if err != nil {
-			return err
-		}
-	} else {
-		err = c.Watch(
-			&source.Kind{Type: &policyv1.PodDisruptionBudget{}},
-			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(obj client.Object) []reconcile.Request {
+	err = c.Watch(
+		source.Kind[client.Object](mgr.GetCache(), &policyv1.PodDisruptionBudget{},
+			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(context ctx.Context, obj client.Object) []reconcile.Request {
 				pdb, ok := obj.(*policyv1.PodDisruptionBudget)
 				if !ok {
 					// Not a pdb, returning empty
@@ -151,15 +116,14 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 			}),
 			),
 			pdbPredicate,
-		)
-		if err != nil {
-			return err
-		}
+		))
+	if err != nil {
+		return err
 	}
 
 	// enqueues with an empty name that is populated by the reconciler.
 	// There is a one-per-namespace limit on CephClusters
-	enqueueByNamespace := handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(obj client.Object) []reconcile.Request {
+	enqueueByNamespace := handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(context ctx.Context, obj client.Object) []reconcile.Request {
 		// The name will be populated in the reconcile
 		namespace := obj.GetNamespace()
 		if len(namespace) == 0 {
@@ -172,19 +136,19 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 	)
 
 	// Watch for CephBlockPools and enqueue the CephCluster in the namespace
-	err = c.Watch(&source.Kind{Type: &cephv1.CephBlockPool{}}, enqueueByNamespace)
+	err = c.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephBlockPool{}, enqueueByNamespace))
 	if err != nil {
 		return err
 	}
 
 	// Watch for CephFileSystems and enqueue the CephCluster in the namespace
-	err = c.Watch(&source.Kind{Type: &cephv1.CephFilesystem{}}, enqueueByNamespace)
+	err = c.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephFilesystem{}, enqueueByNamespace))
 	if err != nil {
 		return err
 	}
 
 	// Watch for CephObjectStores and enqueue the CephCluster in the namespace
-	err = c.Watch(&source.Kind{Type: &cephv1.CephObjectStore{}}, enqueueByNamespace)
+	err = c.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephObjectStore{}, enqueueByNamespace))
 	if err != nil {
 		return err
 	}

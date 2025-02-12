@@ -19,9 +19,12 @@ package k8sutil
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+
+	"sigs.k8s.io/yaml"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	v1 "k8s.io/api/core/v1"
@@ -35,7 +38,7 @@ import (
 // validNodeNoSched returns true if the node (1) meets Rook's placement terms,
 // and (2) is ready. Unlike ValidNode, this method will ignore the
 // Node.Spec.Unschedulable flag. False otherwise.
-func validNodeNoSched(node v1.Node, placement cephv1.Placement) error {
+func validNodeNoSched(node v1.Node, placement cephv1.Placement, scheduleAlways bool) error {
 	p, err := NodeMeetsPlacementTerms(node, placement, false)
 	if err != nil {
 		return fmt.Errorf("failed to check if node meets Rook placement terms. %+v", err)
@@ -45,6 +48,10 @@ func validNodeNoSched(node v1.Node, placement cephv1.Placement) error {
 	}
 
 	if !NodeIsReady(node) {
+		if scheduleAlways {
+			logger.Infof("node %q is not ready but scheduleAlways set", node.Name)
+			return nil
+		}
 		return errors.New("node is not ready")
 	}
 
@@ -53,12 +60,12 @@ func validNodeNoSched(node v1.Node, placement cephv1.Placement) error {
 
 // ValidNode returns true if the node (1) is schedulable, (2) meets Rook's placement terms, and
 // (3) is ready. False otherwise.
-func ValidNode(node v1.Node, placement cephv1.Placement) error {
-	if !GetNodeSchedulable(node) {
+func ValidNode(node v1.Node, placement cephv1.Placement, scheduleAlways bool) error {
+	if !GetNodeSchedulable(node, scheduleAlways) {
 		return errors.New("node is unschedulable")
 	}
 
-	return validNodeNoSched(node, placement)
+	return validNodeNoSched(node, placement, scheduleAlways)
 }
 
 // GetValidNodes returns all nodes that (1) are not cordoned, (2) meet Rook's placement terms, and
@@ -74,7 +81,7 @@ func GetValidNodes(ctx context.Context, rookStorage cephv1.StorageScopeSpec, cli
 	validK8sNodes := []v1.Node{}
 	reasonsForSkippingNodes := map[string][]string{}
 	for _, n := range matchingK8sNodes {
-		err := ValidNode(n, placement)
+		err := ValidNode(n, placement, rookStorage.ScheduleAlways)
 		if err != nil {
 			reason := err.Error()
 			reasonsForSkippingNodes[reason] = append(reasonsForSkippingNodes[reason], n.Name)
@@ -94,7 +101,7 @@ func GetValidNodes(ctx context.Context, rookStorage cephv1.StorageScopeSpec, cli
 // Typically these will be the same name, but sometimes they are not such as when nodes have a longer
 // dns name, but the hostname is short.
 func GetNodeNameFromHostname(ctx context.Context, clientset kubernetes.Interface, hostName string) (string, error) {
-	options := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", v1.LabelHostname, hostName)}
+	options := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", LabelHostname(), hostName)}
 	nodes, err := clientset.CoreV1().Nodes().List(ctx, options)
 	if err != nil {
 		return hostName, err
@@ -116,7 +123,7 @@ func GetNodeHostName(ctx context.Context, clientset kubernetes.Interface, nodeNa
 }
 
 func GetNodeHostNameLabel(node *v1.Node) (string, error) {
-	hostname, ok := node.Labels[v1.LabelHostname]
+	hostname, ok := node.Labels[LabelHostname()]
 	if !ok {
 		return "", fmt.Errorf("hostname not found on the node")
 	}
@@ -134,7 +141,7 @@ func GetNodeHostNames(ctx context.Context, clientset kubernetes.Interface) (map[
 
 	nodeMap := map[string]string{}
 	for _, node := range nodes.Items {
-		nodeMap[node.Name] = node.Labels[v1.LabelHostname]
+		nodeMap[node.Name] = node.Labels[LabelHostname()]
 	}
 	return nodeMap, nil
 }
@@ -142,10 +149,15 @@ func GetNodeHostNames(ctx context.Context, clientset kubernetes.Interface) (map[
 // GetNodeSchedulable returns a boolean if the node is tainted as Schedulable or not
 // true -> Node is schedulable
 // false -> Node is unschedulable
-func GetNodeSchedulable(node v1.Node) bool {
+func GetNodeSchedulable(node v1.Node, scheduleAlways bool) bool {
 	// some unit tests set this to quickly emulate an unschedulable node; if this is set to true,
 	// we can shortcut deeper inspection for schedulability.
-	return !node.Spec.Unschedulable
+	schedulable := !node.Spec.Unschedulable
+	if !schedulable && scheduleAlways {
+		logger.Infof("node %q is unschedulable but scheduling since scheduleAlways is set", node.Name)
+		return true
+	}
+	return schedulable
 }
 
 // NodeMeetsPlacementTerms returns true if the Rook placement allows the node to have resources scheduled
@@ -263,9 +275,10 @@ func rookNodeMatchesKubernetesNode(rookNode cephv1.Node, kubernetesNode v1.Node)
 }
 
 func normalizeHostname(kubernetesNode v1.Node) string {
-	hostname := kubernetesNode.Labels[v1.LabelHostname]
+	hostname := kubernetesNode.Labels[LabelHostname()]
 	if len(hostname) == 0 {
 		// fall back to the node name if the hostname label is not set
+		logger.Warningf("hostname label %q is missing for node %q. Fallback to node name", LabelHostname(), kubernetesNode.Name)
 		hostname = kubernetesNode.Name
 	}
 	return hostname
@@ -279,11 +292,17 @@ func GetKubernetesNodesMatchingRookNodes(ctx context.Context, rookNodes []cephv1
 	if err != nil {
 		return nodes, fmt.Errorf("failed to list kubernetes nodes. %+v", err)
 	}
-	for _, kn := range k8sNodes.Items {
-		for _, rn := range rookNodes {
+	for _, rn := range rookNodes {
+		nodeFound := false
+		for _, kn := range k8sNodes.Items {
 			if rookNodeMatchesKubernetesNode(rn, kn) {
 				nodes = append(nodes, kn)
+				nodeFound = true
+				break
 			}
+		}
+		if !nodeFound {
+			logger.Warningf("failed to find matching kubernetes node for %q. Check the CephCluster's config and confirm each 'name' field in spec.storage.nodes matches their %q label", rn.Name, LabelHostname())
 		}
 	}
 	return nodes, nil
@@ -321,6 +340,11 @@ func RookNodesMatchingKubernetesNodes(rookStorage cephv1.StorageScopeSpec, kuber
 
 // GenerateNodeAffinity will return v1.NodeAffinity or error
 func GenerateNodeAffinity(nodeAffinity string) (*v1.NodeAffinity, error) {
+	affinity, err := evaluateJSONOrYAMLInput(nodeAffinity)
+	if err == nil {
+		return affinity, nil
+	}
+	logger.Debugf("input not a valid JSON or YAML: %s, continuing", err)
 	newNodeAffinity := &v1.NodeAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
 			NodeSelectorTerms: []v1.NodeSelectorTerm{
@@ -377,4 +401,21 @@ func GenerateNodeAffinity(nodeAffinity string) (*v1.NodeAffinity, error) {
 		}
 	}
 	return newNodeAffinity, nil
+}
+
+func evaluateJSONOrYAMLInput(nodeAffinity string) (*v1.NodeAffinity, error) {
+	var err error
+	arr := []byte(nodeAffinity)
+	if !json.Valid(arr) {
+		arr, err = yaml.YAMLToJSON(arr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to process YAML node affinity input: %v", err)
+		}
+	}
+	var affinity *v1.NodeAffinity
+	unmarshalErr := json.Unmarshal(arr, &affinity)
+	if unmarshalErr != nil {
+		return nil, fmt.Errorf("cannot unmarshal affinity: %s", unmarshalErr)
+	}
+	return affinity, nil
 }

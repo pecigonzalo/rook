@@ -30,7 +30,7 @@ metadata:
   name: rook-operator
 rules:
 - apiGroups: [""]
-  resources: ["namespaces", "serviceaccounts", "secrets", "pods", "services", "nodes", "nodes/proxy", "configmaps", "events", "persistenvolumes", "persistentvolumeclaims"]
+  resources: ["namespaces", "serviceaccounts", "secrets", "pods", "services", "nodes", "nodes/proxy", "configmaps", "events", "persistentvolumes", "persistentvolumeclaims"]
   verbs: [ "get", "list", "watch", "patch", "create", "update", "delete" ]
 - apiGroups: ["extensions"]
   resources: ["thirdpartyresources", "deployments", "daemonsets", "replicasets"]
@@ -79,7 +79,7 @@ metadata:
   name: rook-ceph-agent
 rules:
 - apiGroups: [""]
-  resources: ["pods", "secrets", "configmaps", "persistenvolumes", "nodes", "nodes/proxy"]
+  resources: ["pods", "secrets", "configmaps", "persistentvolumes", "nodes", "nodes/proxy"]
   verbs: [ "get", "list" ]
 - apiGroups: ["storage.k8s.io"]
   resources: ["storageclasses"]
@@ -250,7 +250,7 @@ subjects:
   namespace: rook-system
 ```
 
-Notably absent here are privileges to set other RBAC rules and create read cluster-wide secrets and other resources. Because the admin created the `rook-system` namespace and service account they are free to set policies on them using PSP or namespace quotas. Similar to the ones defined [here](https://github.com/rook/rook/blob/master/Documentation/kubernetes.md#rbac-for-podsecuritypolicies)).
+Notably absent here are privileges to set other RBAC rules and create read cluster-wide secrets and other resources. Because the admin created the `rook-system` namespace and service account they are free to set policies on them using PSP or namespace quotas.
 
 Also note that while we use a `ClusterRole` for rook-system we only use a `RoleBinding` to grant it access to the `rook-system` namespace. It does not have cluster-wide privileges.
 

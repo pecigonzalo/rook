@@ -17,13 +17,12 @@ limitations under the License.
 package cleanup
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 
 	"github.com/pkg/errors"
-	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 )
 
 // StartHostPathCleanup is the main entrypoint function to clean up dataDirHostPath and monitor store
@@ -74,11 +73,11 @@ func secretKeyMatch(monDir, monSecret string) (bool, error) {
 	if _, err := os.Stat(keyringDirPath); os.IsNotExist(err) {
 		return false, errors.Wrapf(err, "failed to read keyring %q for the mon directory %q", keyringDirPath, monDir)
 	}
-	contents, err := ioutil.ReadFile(filepath.Clean(keyringDirPath))
+	contents, err := os.ReadFile(filepath.Clean(keyringDirPath))
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to read keyring %q for the mon directory %q", keyringDirPath, monDir)
 	}
-	extractedKey, err := mon.ExtractKey(string(contents))
+	extractedKey, err := opcontroller.ExtractKey(string(contents))
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to extract secret key from the keyring %q for the mon directory %q", keyringDirPath, monDir)
 	}

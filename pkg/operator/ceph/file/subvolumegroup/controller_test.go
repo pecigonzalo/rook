@@ -195,6 +195,8 @@ func TestCephClientController(t *testing.T) {
 			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 				if args[0] == "fs" && args[1] == "subvolumegroup" && args[2] == "create" {
 					return "", nil
+				} else if args[0] == "fs" && args[1] == "subvolumegroup" && args[2] == "pin" {
+					return "", nil
 				}
 
 				return "", errors.Errorf("unknown command. %v", args)
@@ -213,7 +215,7 @@ func TestCephClientController(t *testing.T) {
 
 		// Enable CSI
 		csi.EnableRBD = true
-		os.Setenv("POD_NAMESPACE", namespace)
+		t.Setenv("POD_NAMESPACE", namespace)
 		// Create CSI config map
 		ownerRef := &metav1.OwnerReference{}
 		ownerInfo := k8sutil.NewOwnerInfoWithOwnerRef(ownerRef, "")
@@ -260,7 +262,7 @@ func TestCephClientController(t *testing.T) {
 
 		// Enable CSI
 		csi.EnableRBD = true
-		os.Setenv("POD_NAMESPACE", namespace)
+		t.Setenv("POD_NAMESPACE", namespace)
 		// Create CSI config map
 		ownerRef := &metav1.OwnerReference{}
 		ownerInfo := k8sutil.NewOwnerInfoWithOwnerRef(ownerRef, "")
@@ -273,7 +275,7 @@ func TestCephClientController(t *testing.T) {
 
 		err = r.client.Get(ctx, req.NamespacedName, cephFilesystemSubVolumeGroup)
 		assert.NoError(t, err)
-		assert.Equal(t, cephv1.ConditionConnected, cephFilesystemSubVolumeGroup.Status.Phase)
+		assert.Equal(t, cephv1.ConditionReady, cephFilesystemSubVolumeGroup.Status.Phase)
 		assert.NotEmpty(t, cephFilesystemSubVolumeGroup.Status.Info["clusterID"])
 
 		// test that csi configmap is created
@@ -283,6 +285,51 @@ func TestCephClientController(t *testing.T) {
 		assert.Contains(t, cm.Data[csi.ConfigKey], "clusterID")
 		assert.Contains(t, cm.Data[csi.ConfigKey], "group-a")
 	})
+
+	t.Run("success - test with multus ceph cluster", func(t *testing.T) {
+		cephCluster.Spec.External.Enable = false
+		cephCluster.Spec.Network.Provider = "multus"
+		cephCluster.Status.Phase = cephv1.ConditionReady
+		cephCluster.Status.CephStatus.Health = "HEALTH_OK"
+		objects := []runtime.Object{
+			cephFilesystemSubVolumeGroup,
+			cephCluster,
+			cephFilesystem,
+		}
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
+		c.Client = cl
+
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephBlockPoolList{}, &v1.ConfigMap{})
+		// Create a ReconcileCephFilesystemSubVolumeGroup object with the scheme and fake client.
+		r = &ReconcileCephFilesystemSubVolumeGroup{
+			client:           cl,
+			scheme:           s,
+			context:          c,
+			opManagerContext: ctx,
+		}
+
+		// Enable CSI
+		csi.EnableRBD = true
+		t.Setenv("POD_NAMESPACE", namespace)
+		// Create CSI config map
+		ownerRef := &metav1.OwnerReference{}
+		ownerInfo := k8sutil.NewOwnerInfoWithOwnerRef(ownerRef, "")
+		err := csi.CreateCsiConfigMap(ctx, namespace, c.Clientset, ownerInfo)
+		assert.NoError(t, err)
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+
+		// test that csi configmap is created
+		cm, err := c.Clientset.CoreV1().ConfigMaps(namespace).Get(ctx, csi.ConfigName, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, cm.Data[csi.ConfigKey])
+		assert.Contains(t, cm.Data[csi.ConfigKey], "clusterID")
+		assert.Contains(t, cm.Data[csi.ConfigKey], "group-a")
+		assert.Contains(t, cm.Data[csi.ConfigKey], "netNamespaceFilePath")
+	})
 }
 
 func Test_buildClusterID(t *testing.T) {
@@ -290,4 +337,30 @@ func Test_buildClusterID(t *testing.T) {
 	cephFilesystemSubVolumeGroup := &cephv1.CephFilesystemSubVolumeGroup{ObjectMeta: metav1.ObjectMeta{Namespace: "rook-ceph", Name: longName}, Spec: cephv1.CephFilesystemSubVolumeGroupSpec{FilesystemName: "myfs"}}
 	clusterID := buildClusterID(cephFilesystemSubVolumeGroup)
 	assert.Equal(t, "29e92135b7e8c014079b9f9f3566777d", clusterID)
+}
+
+func Test_formatPinning(t *testing.T) {
+	pinning := &cephv1.CephFilesystemSubVolumeGroupSpecPinning{}
+	pinningStatus := formatPinning(*pinning)
+	assert.Equal(t, "distributed=1", pinningStatus)
+
+	distributedValue := 0
+	pinning.Distributed = &distributedValue
+	pinningStatus = formatPinning(*pinning)
+	assert.Equal(t, "distributed=0", pinningStatus)
+
+	pinning.Distributed = nil
+
+	exportValue := 42
+	pinning.Export = &exportValue
+	pinningStatus = formatPinning(*pinning)
+	assert.Equal(t, "export=42", pinningStatus)
+
+	pinning.Export = nil
+
+	randomValue := 0.31
+	pinning.Random = &randomValue
+	pinningStatus = formatPinning(*pinning)
+	assert.Equal(t, "random=0.31", pinningStatus)
+
 }

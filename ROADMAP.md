@@ -8,23 +8,17 @@ We hope that the items listed below will inspire further engagement from the com
 Any dates listed below and the specific issues that will ship in a given milestone are subject to change but should give a general idea of what we are planning.
 See the [GitHub project boards](https://github.com/rook/rook/projects) for the most up-to-date issues and their status.
 
-## Rook Ceph 1.9
+## Rook Ceph 1.17
 
-The following high level features are targeted for Rook v1.9 (early April 2022). For more detailed project tracking see the [v1.9 board](https://github.com/rook/rook/projects/24).
+The following high level features are targeted for Rook v1.17 (April 2025). For more detailed project tracking see the [v1.17 board](https://github.com/orgs/rook/projects/7).
 
-* Support for Ceph Quincy
-* Support for on-wire encryption and compression [#9054](https://github.com/rook/rook/issues/9054)
-* More complete set of commands for the [Rook Krew plugin](https://github.com/rook/kubectl-rook-ceph)
+* Allow Rook operator to run in multiple namespaces for improved multi-cluster reconcile [#15014](https://github.com/rook/rook/issues/15014)
+* Replace a single OSD when a metadataDevice is configured with multiple OSDs [#13240](https://github.com/rook/rook/issues/13240)
+* CSI Driver
+  * Enable the stable Ceph-CSI operator by default, after it is declared stable [#14766](https://github.com/rook/rook/issues/15271)
+  * Integrate Ceph-CSI [v3.14](https://github.com/ceph/ceph-csi/)
 
-## Themes
+## Kubectl Plugin
 
-The general areas for improvements include the following, though may not be committed to a release.
-
-* Add alpha support for COSI (Container object storage interface) with K8s 1.24 [#7843](https://github.com/rook/rook/issues/7843)
-* iSCSI gateway deployment [#4334](https://github.com/rook/rook/issues/4334)
-* Enable the admission controller by default [#6242](https://github.com/rook/rook/issues/6242)
-* OSD encryption key rotation [#7925](https://github.com/rook/rook/issues/7925)
-* Simplify metadata backup and disaster recovery
-* Strengthen approach for OSDs on PVCs for a more seamless K8s management of underlying storage
-* CSI Driver improvements tracked in the [CSI repo](https://github.com/ceph/ceph-csi)
-  * Support for Windows nodes
+Features are planned for the [Kubectl Plugin](https://github.com/rook/kubectl-rook-ceph), though without a committed timeline.
+* Collect details to help troubleshoot the csi driver [#69](https://github.com/rook/kubectl-rook-ceph/issues/69)

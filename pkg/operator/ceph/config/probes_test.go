@@ -36,11 +36,9 @@ func TestConfigureLivenessProbe(t *testing.T) {
 		cephv1.KeyRgw,
 	}
 
-	store := cephv1.ObjectStoreSpec{}
 	fs := cephv1.CephFilesystem{}
 	healthCheck := cephv1.CephClusterHealthCheckSpec{}
 	livenessProbes := map[cephv1.KeyType]*cephv1.ProbeSpec{
-		"rgw": store.HealthCheck.LivenessProbe,
 		"mds": fs.Spec.MetadataServer.LivenessProbe,
 		"mon": healthCheck.LivenessProbe["mon"],
 		"osd": healthCheck.LivenessProbe["osd"],
@@ -56,7 +54,7 @@ func TestConfigureLivenessProbe(t *testing.T) {
 
 func configLivenessProbeHelper(t *testing.T, keyType cephv1.KeyType, livenessProbes map[cephv1.KeyType]*cephv1.ProbeSpec) {
 	p := &v1.Probe{
-		Handler: v1.Handler{
+		ProbeHandler: v1.ProbeHandler{
 			HTTPGet: &v1.HTTPGetAction{
 				Path: "/",
 				Port: intstr.FromInt(8080),
@@ -77,7 +75,7 @@ func configLivenessProbeHelper(t *testing.T, keyType cephv1.KeyType, livenessPro
 func integrationLivenessProbeCheck(t *testing.T, keyType cephv1.KeyType, livenessProbes map[cephv1.KeyType]*cephv1.ProbeSpec) {
 	t.Run("integration check: configured probes should override values", func(t *testing.T) {
 		defaultProbe := &v1.Probe{
-			Handler: v1.Handler{
+			ProbeHandler: v1.ProbeHandler{
 				HTTPGet: &v1.HTTPGetAction{
 					Path: "/",
 					Port: intstr.FromInt(8443),
@@ -85,7 +83,7 @@ func integrationLivenessProbeCheck(t *testing.T, keyType cephv1.KeyType, livenes
 			},
 		}
 		userProbe := &v1.Probe{
-			Handler: v1.Handler{
+			ProbeHandler: v1.ProbeHandler{
 				HTTPGet: &v1.HTTPGetAction{
 					Path: "/custom/path",
 					Port: intstr.FromInt(8080),
@@ -108,7 +106,7 @@ func integrationLivenessProbeCheck(t *testing.T, keyType cephv1.KeyType, livenes
 		// the resultant container's startup probe should have been overridden, but the handler
 		// should always be the rook-given default
 		expectedProbe := *userProbe
-		expectedProbe.Handler = defaultProbe.Handler
+		expectedProbe.ProbeHandler = defaultProbe.ProbeHandler
 		assert.Equal(t, &expectedProbe, got.StartupProbe)
 	})
 }
@@ -140,7 +138,7 @@ func TestConfigureStartupProbe(t *testing.T) {
 
 func configStartupProbeHelper(t *testing.T, keyType cephv1.KeyType, startupProbes map[cephv1.KeyType]*cephv1.ProbeSpec) {
 	p := &v1.Probe{
-		Handler: v1.Handler{
+		ProbeHandler: v1.ProbeHandler{
 			HTTPGet: &v1.HTTPGetAction{
 				Path: "/",
 				Port: intstr.FromInt(8080),
@@ -160,7 +158,7 @@ func configStartupProbeHelper(t *testing.T, keyType cephv1.KeyType, startupProbe
 func integrationStartupProbeCheck(t *testing.T, keyType cephv1.KeyType, startupProbes map[cephv1.KeyType]*cephv1.ProbeSpec) {
 	t.Run("integration check: configured probes should override values", func(t *testing.T) {
 		defaultProbe := &v1.Probe{
-			Handler: v1.Handler{
+			ProbeHandler: v1.ProbeHandler{
 				HTTPGet: &v1.HTTPGetAction{
 					Path: "/",
 					Port: intstr.FromInt(8443),
@@ -168,7 +166,7 @@ func integrationStartupProbeCheck(t *testing.T, keyType cephv1.KeyType, startupP
 			},
 		}
 		userProbe := &v1.Probe{
-			Handler: v1.Handler{
+			ProbeHandler: v1.ProbeHandler{
 				HTTPGet: &v1.HTTPGetAction{
 					Path: "/custom/path",
 					Port: intstr.FromInt(8080),
@@ -191,7 +189,7 @@ func integrationStartupProbeCheck(t *testing.T, keyType cephv1.KeyType, startupP
 		// the resultant container's startup probe should have been overridden, but the handler
 		// should always be the rook-given default
 		expectedProbe := *userProbe
-		expectedProbe.Handler = defaultProbe.Handler
+		expectedProbe.ProbeHandler = defaultProbe.ProbeHandler
 		assert.Equal(t, &expectedProbe, got.StartupProbe)
 	})
 }
@@ -199,7 +197,7 @@ func integrationStartupProbeCheck(t *testing.T, keyType cephv1.KeyType, startupP
 func TestGetProbeWithDefaults(t *testing.T) {
 	t.Run("using default probe", func(t *testing.T) {
 		currentProb := &v1.Probe{
-			Handler: v1.Handler{
+			ProbeHandler: v1.ProbeHandler{
 				Exec: &v1.ExecAction{
 					// Example:
 					Command: []string{
@@ -221,7 +219,7 @@ func TestGetProbeWithDefaults(t *testing.T) {
 
 	t.Run("overriding default probes", func(t *testing.T) {
 		currentProb := &v1.Probe{
-			Handler: v1.Handler{
+			ProbeHandler: v1.ProbeHandler{
 				Exec: &v1.ExecAction{
 					// Example:
 					Command: []string{
@@ -237,7 +235,7 @@ func TestGetProbeWithDefaults(t *testing.T) {
 		}
 
 		desiredProbe := &v1.Probe{
-			Handler: v1.Handler{
+			ProbeHandler: v1.ProbeHandler{
 				Exec: &v1.ExecAction{
 					// Example:
 					Command: []string{

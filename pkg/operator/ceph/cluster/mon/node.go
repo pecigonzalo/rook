@@ -18,13 +18,27 @@ package mon
 
 import (
 	"github.com/pkg/errors"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/k8sutil"
 	v1 "k8s.io/api/core/v1"
 )
 
-func getNodeInfoFromNode(n v1.Node) (*MonScheduleInfo, error) {
-	nr := &MonScheduleInfo{
+const (
+	monIPAnnotation = "network.rook.io/mon-ip"
+)
+
+func getNodeInfoFromNode(n v1.Node) (*opcontroller.MonScheduleInfo, error) {
+	nr := &opcontroller.MonScheduleInfo{
 		Name:     n.Name,
-		Hostname: n.Labels[v1.LabelHostname],
+		Hostname: n.Labels[k8sutil.LabelHostname()],
+	}
+
+	// If the host networking is setup such that a different IP should be used
+	// than the one that is to the K8s node.
+	if customIP, ok := n.Annotations[monIPAnnotation]; ok {
+		logger.Infof("found %s annotation on node %q --> %q", monIPAnnotation, n.Name, customIP)
+		nr.Address = customIP
+		return nr, nil
 	}
 
 	for _, ip := range n.Status.Addresses {

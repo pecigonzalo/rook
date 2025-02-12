@@ -7,95 +7,87 @@ defaults:
     # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
     shell: bash --noprofile --norc -eo pipefail -x {0}
 
+# cancel the in-progress workflow when PR is refreshed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   macos-build:
-    runs-on: macos-10.15
+    runs-on: macos-latest
     if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
-    - uses: actions/setup-go@v2
-      with:
-        go-version: 1.16
+      - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version: "1.23"
 
-    - name: copy working directory to GOPATH
-      run: sudo mkdir -p /Users/runner/go/src/github.com && sudo cp -a /Users/runner/work/rook /Users/runner/go/src/github.com/
+      - name: Set up Helm
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: v3.6.2
 
-    - name: build rook
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: |
-        GOPATH=$(go env GOPATH) make clean && make -j$nproc IMAGES='ceph' BUILD_CONTAINER_IMAGE=false build
+      - name: build rook
+        run: |
+          GOPATH=$(go env GOPATH) make clean && make -j$nproc IMAGES='ceph' BUILD_CONTAINER_IMAGE=false build
 
-    - name: validate build
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: tests/scripts/validate_modified_files.sh build
+      - name: validate build
+        run: tests/scripts/validate_modified_files.sh build
 
-    - name: run codegen
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: GOPATH=$(go env GOPATH) make codegen
+      - name: run codegen
+        run: GOPATH=$(go env GOPATH) make codegen
 
-    - name: validate codegen
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: tests/scripts/validate_modified_files.sh codegen
+      - name: validate codegen
+        run: tests/scripts/validate_modified_files.sh codegen
 
-    - name: run mod check
-      run: GOPATH=$(go env GOPATH) make -j $(nproc) mod.check
+      - name: run mod check
+        run: GOPATH=$(go env GOPATH) make -j $(nproc) mod.check
 
-    - name: validate modcheck
-      run: tests/scripts/validate_modified_files.sh modcheck
+      - name: validate modcheck
+        run: tests/scripts/validate_modified_files.sh modcheck
 
-    - name: run crds-gen
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: make csv-clean && GOPATH=$(go env GOPATH) make crds
+      - name: run crds-gen
+        run: GOPATH=$(go env GOPATH) make crds
 
-    - name: validate crds-gen
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: tests/scripts/validate_modified_files.sh crd
+      - name: validate crds-gen
+        run: tests/scripts/validate_modified_files.sh crd
 
-    - name: run gen-rbac
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: GOPATH=$(go env GOPATH) make gen-rbac
+      - name: run gen-rbac
+        run: GOPATH=$(go env GOPATH) make gen-rbac
 
-    - name: validate gen-rbac
-      working-directory: /Users/runner/go/src/github.com/rook/rook
-      run: tests/scripts/validate_modified_files.sh gen-rbac
-
-    - name: setup tmate session for debugging
-      if: failure()
-      uses: mxschmitt/action-tmate@v3
-      timeout-minutes: 60
+      - name: validate gen-rbac
+        run: tests/scripts/validate_modified_files.sh gen-rbac
 
   linux-build-all:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
     strategy:
       fail-fast: false
       matrix:
-        go-version : ['1.16', '1.17']
+        go-version: ["1.22", "1.23"]
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
-    - name: setup golang ${{ matrix.go-version }}
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{ matrix.go-version }}
+      - name: setup golang ${{ matrix.go-version }}
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version: ${{ matrix.go-version }}
 
-    - name: set up QEMU
-      uses: docker/setup-qemu-action@master
-      with:
-        platforms: all
+      - name: set up QEMU
+        uses: docker/setup-qemu-action@4574d27a4764455b42196d70a065bc6853246a25 # master
+        with:
+          platforms: all
 
-    - name: build.all rook with go ${{ matrix.go-version }}
-      run: |
-        tests/scripts/github-action-helper.sh build_rook_all
-
-    - name: setup tmate session for debugging
-      if: failure()
-      uses: mxschmitt/action-tmate@v3
-      timeout-minutes: 60
+      - name: build.all rook with go ${{ matrix.go-version }}
+        run: |
+          tests/scripts/github-action-helper.sh build_rook_all

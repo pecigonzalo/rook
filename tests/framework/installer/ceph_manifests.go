@@ -18,15 +18,18 @@ package installer
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/rook/rook/pkg/operator/ceph/object/cosi"
 	"github.com/rook/rook/tests/framework/utils"
 )
 
 type CephManifests interface {
 	Settings() *TestCephSettings
 	GetCRDs(k8shelper *utils.K8sHelper) string
+	GetCSINFSRBAC() string
 	GetOperator() string
 	GetCommon() string
 	GetCommonExternal() string
@@ -36,13 +39,15 @@ type CephManifests interface {
 	GetBlockPool(poolName, replicaSize string) string
 	GetBlockStorageClass(poolName, storageClassName, reclaimPolicy string) string
 	GetFileStorageClass(fsName, storageClassName string) string
+	GetNFSStorageClass(fsName, nfsClusterName, server, storageClassName string) string
+	GetNFSSnapshotClass(fsName, snapshotClassName string) string
 	GetBlockSnapshotClass(snapshotClassName, reclaimPolicy string) string
 	GetFileStorageSnapshotClass(snapshotClassName, reclaimPolicy string) string
 	GetFilesystem(name string, activeCount int) string
 	GetNFS(name string, daemonCount int) string
 	GetNFSPool() string
 	GetRBDMirror(name string, daemonCount int) string
-	GetObjectStore(name string, replicaCount, port int, tlsEnable bool) string
+	GetObjectStore(name string, replicaCount, port int, tlsEnable bool, swiftAndKeystone bool) string
 	GetObjectStoreUser(name, displayName, store, usercaps, maxsize string, maxbuckets, maxobjects int) string
 	GetBucketStorageClass(storeName, storageClassName, reclaimPolicy string) string
 	GetOBC(obcName, storageClassName, bucketName string, maxObject string, createBucket bool) string
@@ -50,6 +55,10 @@ type CephManifests interface {
 	GetBucketNotification(notificationName string, topicName string) string
 	GetBucketTopic(topicName string, storeName string, httpEndpointService string) string
 	GetClient(name string, caps map[string]string) string
+	GetFilesystemSubvolumeGroup(fsName, groupName string) string
+	GetCOSIDriver() string
+	GetBucketClass(name, objectstoreUserName, deletionPolicy string) string
+	GetBucketClaim(claimName, className string) string
 }
 
 // CephManifestsMaster wraps rook yaml definitions
@@ -62,7 +71,7 @@ func NewCephManifests(settings *TestCephSettings) CephManifests {
 	switch settings.RookVersion {
 	case LocalBuildTag:
 		return &CephManifestsMaster{settings}
-	case Version1_8:
+	case Version1_15:
 		return &CephManifestsPreviousVersion{settings, &CephManifestsMaster{settings}}
 	}
 	panic(fmt.Errorf("unrecognized ceph manifest version: %s", settings.RookVersion))
@@ -74,6 +83,10 @@ func (m *CephManifestsMaster) Settings() *TestCephSettings {
 
 func (m *CephManifestsMaster) GetCRDs(k8shelper *utils.K8sHelper) string {
 	return m.settings.readManifest("crds.yaml")
+}
+
+func (m *CephManifestsMaster) GetCSINFSRBAC() string {
+	return m.settings.readManifest("/csi/nfs/rbac.yaml")
 }
 
 func (m *CephManifestsMaster) GetOperator() string {
@@ -100,7 +113,14 @@ func (m *CephManifestsMaster) GetToolbox() string {
 		manifest = strings.ReplaceAll(manifest, "name: rook-direct-mount", "name: rook-ceph-tools")
 		return strings.ReplaceAll(manifest, "app: rook-direct-mount", "app: rook-ceph-tools")
 	}
-	return m.settings.readManifest("toolbox.yaml")
+	manifest := m.settings.readManifest("toolbox.yaml")
+	if m.settings.CephVersion.Image != "" {
+		// The toolbox uses the ceph image, so replace the version that is being tested
+		// The regex allows for any character in the tag ("\S" --> non-whitespace character)
+		versionRegex := regexp.MustCompile(`image: quay.io/ceph/ceph:\S+`)
+		manifest = versionRegex.ReplaceAllString(manifest, "image: "+m.settings.CephVersion.Image)
+	}
+	return manifest
 }
 
 //**********************************************************************************
@@ -126,8 +146,7 @@ func (m *CephManifestsMaster) GetCephCluster() string {
 	if m.settings.MultipleMgrs {
 		mgrCount = 2
 	}
-	if m.settings.UsePVC {
-		return `apiVersion: ceph.rook.io/v1
+	clusterSpec := `apiVersion: ceph.rook.io/v1
 kind: CephCluster
 metadata:
   # set the name to something different from the namespace
@@ -136,19 +155,10 @@ metadata:
 spec:
   resources: null
   dataDirHostPath: ` + m.settings.DataDirHostPath + `
-  mon:
-    count: ` + strconv.Itoa(m.settings.Mons) + `
-    allowMultiplePerNode: true
-    volumeClaimTemplate:
-      spec:
-        storageClassName: ` + m.settings.StorageClassName + `
-        resources:
-          requests:
-            storage: 5Gi
   cephVersion:
     image: ` + m.settings.CephVersion.Image + `
     allowUnsupported: ` + strconv.FormatBool(m.settings.CephVersion.AllowUnsupported) + `
-  skipUpgradeChecks: false
+  skipUpgradeChecks: true
   continueUpgradeAfterChecksEvenIfNotHealthy: false
   mgr:
     count: ` + strconv.Itoa(mgrCount) + `
@@ -158,6 +168,7 @@ spec:
   network:
     hostNetwork: false
     connections:
+      requireMsgr2: ` + strconv.FormatBool(m.settings.RequireMsgr2) + `
       encryption:
         enabled: ` + strconv.FormatBool(m.settings.ConnectionsEncrypted) + `
       compression:
@@ -165,6 +176,35 @@ spec:
   crashCollector:
     disable: false
     ` + pruner + `
+  logCollector:
+    enabled: true
+    periodicity: daily
+    maxLogSize: 500M
+  disruptionManagement:
+    managePodBudgets: true
+    osdMaintenanceTimeout: 30
+    pgHealthCheckTimeout: 0
+  healthCheck:
+    daemonHealth:
+      mon:
+        interval: 10s
+        timeout: 15s
+      osd:
+        interval: 10s
+      status:
+        interval: 5s`
+
+	if m.settings.UsePVC {
+		clusterSpec += `
+  mon:
+    count: ` + strconv.Itoa(m.settings.Mons) + `
+    allowMultiplePerNode: true
+    volumeClaimTemplate:
+      spec:
+        storageClassName: ` + m.settings.StorageClassName + `
+        resources:
+          requests:
+            storage: 5Gi
   storage:
     config:
       ` + crushRoot + `
@@ -185,72 +225,43 @@ spec:
           volumeMode: Block
           accessModes:
             - ReadWriteOnce
-  disruptionManagement:
-    managePodBudgets: true
-    osdMaintenanceTimeout: 30
-    pgHealthCheckTimeout: 0
-    manageMachineDisruptionBudgets: false
-    machineDisruptionBudgetNamespace: openshift-machine-api`
-	}
-
-	return `apiVersion: ceph.rook.io/v1
-kind: CephCluster
-metadata:
-  name: ` + m.settings.ClusterName + `
-  namespace: ` + m.settings.Namespace + `
-spec:
-  resources: null
-  cephVersion:
-    image: ` + m.settings.CephVersion.Image + `
-    allowUnsupported: ` + strconv.FormatBool(m.settings.CephVersion.AllowUnsupported) + `
-  dataDirHostPath: ` + m.settings.DataDirHostPath + `
-  network:
-    hostNetwork: false
-    connections:
-      encryption:
-        enabled: ` + strconv.FormatBool(m.settings.ConnectionsEncrypted) + `
-      compression:
-        enabled: ` + strconv.FormatBool(m.settings.ConnectionsCompressed) + `
-  crashCollector:
-    disable: false
-    ` + pruner + `
+`
+	} else {
+		clusterSpec += `
   mon:
     count: ` + strconv.Itoa(m.settings.Mons) + `
     allowMultiplePerNode: true
-  dashboard:
-    enabled: true
-  skipUpgradeChecks: true
-  metadataDevice:
   storage:
     useAllNodes: ` + strconv.FormatBool(!m.settings.SkipOSDCreation) + `
     useAllDevices: ` + strconv.FormatBool(!m.settings.SkipOSDCreation) + `
     deviceFilter:  ` + getDeviceFilter() + `
     config:
       databaseSizeMB: "1024"
-      journalSizeMB: "1024"
-  mgr:
-    count: ` + strconv.Itoa(mgrCount) + `
-    allowMultiplePerNode: true
-    modules:
-    - name: pg_autoscaler
-      enabled: true
-    - name: rook
-      enabled: true
-  healthCheck:
-    daemonHealth:
-      mon:
-        interval: 10s
-        timeout: 15s
-      osd:
-        interval: 10s
-      status:
-        interval: 5s`
+    fullRatio: 0.96
+    backfillFullRatio: 0.91
+    nearFullRatio: 0.88
+`
+	}
+
+	if m.settings.ConnectionsEncrypted {
+		clusterSpec += `
+  csi:
+    cephfs:
+      kernelMountOptions: ms_mode=secure
+  `
+	}
+	return clusterSpec + `
+  priorityClassNames:
+    mon: system-node-critical
+    osd: system-node-critical
+    mgr: system-cluster-critical
+`
 }
 
 func (m *CephManifestsMaster) GetBlockSnapshotClass(snapshotClassName, reclaimPolicy string) string {
 	// Create a CSI driver snapshotclass
 	return `
-apiVersion: snapshot.storage.k8s.io/v1beta1
+apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:
   name: ` + snapshotClassName + `
@@ -266,7 +277,7 @@ parameters:
 func (m *CephManifestsMaster) GetFileStorageSnapshotClass(snapshotClassName, reclaimPolicy string) string {
 	// Create a CSI driver snapshotclass
 	return `
-apiVersion: snapshot.storage.k8s.io/v1beta1
+apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:
   name: ` + snapshotClassName + `
@@ -323,11 +334,6 @@ parameters:
   imageFeatures: layering
   csi.storage.k8s.io/fstype: ext4
 `
-	if m.settings.ConnectionsEncrypted {
-		// encryption requires either the 5.11 kernel or the nbd mounter. Until the newer
-		// kernel is available in minikube, we need to test with nbd.
-		sc += "  mounter: rbd-nbd"
-	}
 	return sc
 }
 
@@ -351,11 +357,59 @@ parameters:
   csi.storage.k8s.io/node-stage-secret-namespace: ` + m.settings.Namespace + `
 `
 	if m.settings.ConnectionsEncrypted {
-		// encryption requires either the 5.11 kernel or the fuse mounter. Until the newer
-		// kernel is available in minikube, we need to test with fuse.
-		sc += "  mounter: fuse"
+		// Encryption with kernel version <= 5.11 requires 'mounter: fuse'. For kernel version >= 5.12, it requires 'mounter: kernel'.
+		// Since the Github action Minikube has kernel version > 5.12, the setting is set to 'mounter: kernel'.
+		sc += "  mounter: kernel"
 	}
 	return sc
+}
+
+func (m *CephManifestsMaster) GetNFSStorageClass(fsName, nfsClusterName, server, storageClassName string) string {
+	// Create a CSI driver storage class
+	csiCephFSNodeSecret := "rook-csi-cephfs-node"               //nolint:gosec // We safely suppress gosec in tests file
+	csiCephFSProvisionerSecret := "rook-csi-cephfs-provisioner" //nolint:gosec // We safely suppress gosec in tests file
+	sc := `
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ` + storageClassName + `
+provisioner: ` + m.settings.OperatorNamespace + `.nfs.csi.ceph.com
+parameters:
+  clusterID: ` + m.settings.Namespace + `
+  fsName: ` + fsName + `
+  nfsCluster: ` + nfsClusterName + `
+  server: ` + server + `
+  pool: ` + fsName + `-data0
+  csi.storage.k8s.io/provisioner-secret-name: ` + csiCephFSProvisionerSecret + `
+  csi.storage.k8s.io/provisioner-secret-namespace: ` + m.settings.Namespace + `
+  csi.storage.k8s.io/node-stage-secret-name: ` + csiCephFSNodeSecret + `
+  csi.storage.k8s.io/node-stage-secret-namespace: ` + m.settings.Namespace + `
+mountOptions:
+  - "nolock"
+`
+	// "nolock" mountOptions has been added to prevent the following error in ci environment:
+	// rpc error: code = Internal desc = mount failed: exit status 32
+	// Mounting command: mount
+	// Mounting arguments: -t nfs <src> <dest>
+	// Output: mount.nfs: rpc.statd is not running but is required for remote locking.
+	// mount.nfs: Either use '-o nolock' to keep locks local, or start statd.
+	return sc
+}
+
+func (m *CephManifestsMaster) GetNFSSnapshotClass(snapshotClassName, reclaimPolicy string) string {
+	// return NFS CSI snapshotclass object.
+	return `
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ` + snapshotClassName + `
+driver: ` + m.settings.OperatorNamespace + `.nfs.csi.ceph.com
+deletionPolicy: ` + reclaimPolicy + `
+parameters:
+  clusterID: ` + m.settings.Namespace + `
+  csi.storage.k8s.io/snapshotter-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/snapshotter-secret-namespace: ` + m.settings.Namespace + `
+`
 }
 
 // GetFilesystem returns the manifest to create a Rook filesystem resource with the given config.
@@ -410,40 +464,30 @@ spec:
     requireSafeReplicaSize: false`
 }
 
-func (m *CephManifestsMaster) GetObjectStore(name string, replicaCount, port int, tlsEnable bool) string {
-	if tlsEnable {
-		return `apiVersion: ceph.rook.io/v1
-kind: CephObjectStore
-metadata:
-  name: ` + name + `
-  namespace: ` + m.settings.Namespace + `
-spec:
-  metadataPool:
-    replicated:
-      size: 1
-      requireSafeReplicaSize: false
-    compressionMode: passive
-  dataPool:
-    replicated:
-      size: 1
-      requireSafeReplicaSize: false
-  gateway:
-    resources: null
-    type: s3
-    securePort: ` + strconv.Itoa(port) + `
-    instances: ` + strconv.Itoa(replicaCount) + `
-    sslCertificateRef: ` + name + `
-  healthCheck:
-    bucket:
-      disabled: false
-      interval: 10s
-`
+func (m *CephManifestsMaster) GetObjectStore(name string, replicaCount, port int, tlsEnable bool, swiftAndKeystone bool) string {
+	type Spec struct {
+		Name             string
+		TLS              bool
+		Port             int
+		ReplicaCount     int
+		SwiftAndKeystone bool
+		Manifests        *CephManifestsMaster
 	}
-	return `apiVersion: ceph.rook.io/v1
+
+	spec := Spec{
+		Name:             name,
+		TLS:              tlsEnable,
+		ReplicaCount:     replicaCount,
+		Port:             port,
+		SwiftAndKeystone: swiftAndKeystone,
+		Manifests:        m,
+	}
+
+	tmpl := `apiVersion: ceph.rook.io/v1
 kind: CephObjectStore
 metadata:
-  name: ` + name + `
-  namespace: ` + m.settings.Namespace + `
+  name: {{ .Name }}
+  namespace: {{ .Manifests.Settings.Namespace }}
 spec:
   metadataPool:
     replicated:
@@ -454,15 +498,36 @@ spec:
     replicated:
       size: 1
       requireSafeReplicaSize: false
+  {{ if .SwiftAndKeystone }}
+  auth:
+    keystone:
+      acceptedRoles:
+        - admin
+        - member
+        - service
+      implicitTenants: "true"
+      revocationInterval: 1200
+      serviceUserSecretName: usersecret
+      tokenCacheSize: 1000
+      url: https://keystone.{{ .Manifests.Settings.Namespace }}.svc/
+  protocols:
+    swift:
+      accountInUrl: false
+      urlPrefix: foobar
+    s3:
+      enabled: true
+      authUseKeystone: true
+  {{ end }}
   gateway:
     resources: null
-    port: ` + strconv.Itoa(port) + `
-    instances: ` + strconv.Itoa(replicaCount) + `
-  healthCheck:
-    bucket:
-      disabled: false
-      interval: 5s
-`
+    {{ if .TLS }}securePort: {{ .Port }}{{ else }}port: {{ .Port }}{{ end }}
+    instances: {{ .ReplicaCount }}
+    {{ if .SwiftAndKeystone }}
+    caBundleRef: keystone-bundle
+    {{ end }}
+    {{ if .TLS }}sslCertificateRef: {{ .Name }}{{ end }}`
+
+	return renderTemplate(tmpl, spec)
 }
 
 func (m *CephManifestsMaster) GetObjectStoreUser(name, displayName, store, usercaps, maxsize string, maxbuckets, maxobjects int) string {
@@ -479,10 +544,12 @@ spec:
     maxObjects: ` + strconv.Itoa(maxobjects) + `
     maxSize: ` + maxsize + `
   capabilities:
-    user: ` + usercaps
+    user: "` + usercaps + `"
+    bucket: "` + usercaps + `"
+`
 }
 
-//GetBucketStorageClass returns the manifest to create object bucket
+// GetBucketStorageClass returns the manifest to create object bucket
 func (m *CephManifestsMaster) GetBucketStorageClass(storeName, storageClassName, reclaimPolicy string) string {
 	return `apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -495,7 +562,7 @@ parameters:
     objectStoreNamespace: ` + m.settings.Namespace
 }
 
-//GetOBC returns the manifest to create object bucket claim
+// GetOBC returns the manifest to create object bucket claim
 func (m *CephManifestsMaster) GetOBC(claimName string, storageClassName string, objectBucketName string, maxObject string, varBucketName bool) string {
 	bucketParameter := "generateBucketName"
 	if varBucketName {
@@ -512,7 +579,7 @@ spec:
     maxObjects: "` + maxObject + `"`
 }
 
-//GetOBCNotification returns the manifest to create object bucket claim
+// GetOBCNotification returns the manifest to create object bucket claim
 func (m *CephManifestsMaster) GetOBCNotification(claimName string, storageClassName string, objectBucketName string, notificationName string, varBucketName bool) string {
 	bucketParameter := "generateBucketName"
 	if varBucketName {
@@ -529,7 +596,7 @@ spec:
   storageClassName: ` + storageClassName
 }
 
-//GetBucketNotification returns the manifest to create ceph bucket notification
+// GetBucketNotification returns the manifest to create ceph bucket notification
 func (m *CephManifestsMaster) GetBucketNotification(notificationName string, topicName string) string {
 	return `apiVersion: ceph.rook.io/v1
 kind: CephBucketNotification
@@ -543,7 +610,7 @@ spec:
 `
 }
 
-//GetBucketTopic returns the manifest to create ceph bucket topic
+// GetBucketTopic returns the manifest to create ceph bucket topic
 func (m *CephManifestsMaster) GetBucketTopic(topicName string, storeName string, httpEndpointService string) string {
 	return `apiVersion: ceph.rook.io/v1
 kind: CephBucketTopic
@@ -599,4 +666,52 @@ metadata:
   namespace: ` + m.settings.Namespace + `
 spec:
   count: ` + strconv.Itoa(count)
+}
+
+func (m *CephManifestsMaster) GetFilesystemSubvolumeGroup(fsName, groupName string) string {
+	return `apiVersion: ceph.rook.io/v1
+kind: CephFilesystemSubVolumeGroup
+metadata:
+  name: ` + groupName + `
+  namespace: ` + m.settings.Namespace + `
+spec:
+  filesystemName: ` + fsName + `
+  quota: 10G
+  dataPoolName: ` + fsName + "-data0"
+}
+
+func (m *CephManifestsMaster) GetCOSIDriver() string {
+	// TODO: use the official image once it is available
+	return `apiVersion: ceph.rook.io/v1
+kind: CephCOSIDriver
+metadata:
+  name: ` + cosi.CephCOSIDriverName + `
+  namespace: ` + m.settings.OperatorNamespace + `
+spec:
+  deploymentStrategy: Auto `
+}
+
+func (m *CephManifestsMaster) GetBucketClass(name, objectStoreUserSecretName, deletionPolicy string) string {
+	return `apiVersion: objectstorage.k8s.io/v1alpha1
+kind: BucketClass
+metadata:
+  name: ` + name + `
+  namespace: ` + m.settings.OperatorNamespace + `
+driverName: ` + cosi.CephCOSIDriverPrefix + `.ceph.objectstorage.k8s.io
+deletionPolicy: ` + deletionPolicy + `
+parameters:
+  objectStoreUserSecretName:  ` + objectStoreUserSecretName + `
+  objectStoreUserSecretNamespace: ` + m.settings.Namespace
+}
+
+func (m *CephManifestsMaster) GetBucketClaim(name, bucketClassName string) string {
+	return `apiVersion: objectstorage.k8s.io/v1alpha1
+kind: BucketClaim
+metadata:
+  name: ` + name + `
+  namespace: ` + m.settings.OperatorNamespace + `
+spec:
+  bucketClassName: ` + bucketClassName + `
+  protocols:
+    - s3 `
 }

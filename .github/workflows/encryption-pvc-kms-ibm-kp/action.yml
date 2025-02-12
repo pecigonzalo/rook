@@ -7,8 +7,11 @@ inputs:
   ibm-service-api-key:
     description: IBM_KP_SERVICE_API_KEY from the calling workflow
     required: true
-  github-token:
-    description: GITHUB_TOKEN from the calling workflow
+  artifact-name:
+    description: the name of the artifact where logs will be stored
+    required: true
+  ceph-image:
+    description: the name of ceph image
     required: true
 
 runs:
@@ -23,9 +26,11 @@ runs:
       run: echo "IBM_KP_SERVICE_INSTANCE_ID and IBM_KP_SERVICE_API_KEY must be set in the environment" && exit 0
 
     - name: setup cluster resources
-      uses: ./.github/workflows/setup-cluster-resources
-      with:
-        github-token: ${{ inputs.github-token }}
+      uses: ./.github/workflows/canary-test-config
+
+    - name: set Ceph version in CephCluster manifest
+      shell: bash --noprofile --norc -eo pipefail -x {0}
+      run: tests/scripts/github-action-helper.sh replace_ceph_image  "deploy/examples/cluster-test.yaml" "${{ inputs.ceph-image }}"
 
     - name: use local disk and create partitions for osds
       shell: bash --noprofile --norc -eo pipefail -x {0}
@@ -36,7 +41,8 @@ runs:
     - name: create cluster prerequisites
       shell: bash --noprofile --norc -eo pipefail -x {0}
       run: |
-        tests/scripts/localPathPV.sh $(lsblk --paths|awk '/14G/ {print $1}'| head -1)
+        export BLOCK="/dev/$(tests/scripts/github-action-helper.sh find_extra_block_dev)"
+        tests/scripts/localPathPV.sh "$BLOCK"
         tests/scripts/github-action-helper.sh create_cluster_prerequisites
 
     - name: deploy cluster
@@ -57,7 +63,7 @@ runs:
 
     - name: wait for prepare pod
       shell: bash --noprofile --norc -eo pipefail -x {0}
-      run: tests/scripts/github-action-helper.sh wait_for_prepare_pod
+      run: tests/scripts/github-action-helper.sh wait_for_prepare_pod 2
 
     - name: wait for ceph to be ready
       shell: bash --noprofile --norc -eo pipefail -x {0}
@@ -75,7 +81,7 @@ runs:
       if: always()
       uses: ./.github/workflows/collect-logs
       with:
-        name: encryption-pvc-kms-ibm-kp
+        name: ${{ inputs.artifact-name }}
 
     - name: teardown cluster so that keys are removed from the KMS
       shell: bash --noprofile --norc -eo pipefail -x {0}

@@ -4,59 +4,69 @@ on:
     branches:
       - master
       - release-*
+    paths-ignore:
+      - "Documentation/**"
+      - "design/**"
 
 defaults:
   run:
     # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
     shell: bash --noprofile --norc -eo pipefail -x {0}
 
+# cancel the in-progress workflow when PR is refreshed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   TestCephHelmSuite:
     if: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/master' && !contains(github.event.pull_request.labels.*.name, 'skip-ci') }}
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kubernetes-versions : ['v1.16.15', 'v1.23.0']
+        kubernetes-versions: ["v1.27.16", "v1.32.0"]
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
-    - name: setup cluster resources
-      uses: ./.github/workflows/integration-test-setup
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        kubernetes-version: ${{ matrix.kubernetes-versions }}
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
+        with:
+          use-tmate: ${{ secrets.USE_TMATE }}
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
 
-    - name: remove read permission from kube config file
-      run: sudo chmod go-r ~/.kube/config
+      - name: setup latest cluster resources
+        uses: ./.github/workflows/integration-test-config-latest-k8s
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-versions }}
 
-    - name: TestCephHelmSuite
-      run: |
-        tests/scripts/github-action-helper.sh collect_udev_logs_in_background
-        tests/scripts/github-action-helper.sh create_helm_tag
-        tests/scripts/helm.sh up
-        export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-        SKIP_TEST_CLEANUP=false SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -failfast -run CephHelmSuite github.com/rook/rook/tests/integration
+      - name: remove read permission from kube config file
+        run: sudo chmod go-r ~/.kube/config
 
-    - name: collect common logs
-      if: always()
-      run: |
-        export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
-        export CLUSTER_NAMESPACE="helm-ns"
-        export OPERATOR_NAMESPACE="helm-ns-system"
-        tests/scripts/collect-logs.sh
+      - name: TestCephHelmSuite
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          tests/scripts/github-action-helper.sh create_helm_tag
+          tests/scripts/helm.sh up
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          SKIP_TEST_CLEANUP=false SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -failfast -run CephHelmSuite github.com/rook/rook/tests/integration
 
-    - name: Artifact
-      uses: actions/upload-artifact@v2
-      if: failure()
-      with:
-        name: ceph-helm-suite-artifact-${{ matrix.kubernetes-versions }}
-        path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="helm-ns"
+          tests/scripts/collect-logs.sh
 
-    - name: setup tmate session for debugging when event is PR
-      if: failure() && github.event_name == 'pull_request'
-      uses: mxschmitt/action-tmate@v3
-      timeout-minutes: 60
+      - name: Artifact
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        if: failure()
+        with:
+          name: ceph-helm-suite-artifact-${{ matrix.kubernetes-versions }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/

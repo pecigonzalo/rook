@@ -9,6 +9,10 @@ spec:
       app: csi-cephfsplugin
   updateStrategy:
     type: {{ .CephFSPluginUpdateStrategy }}
+    {{ if eq .CephFSPluginUpdateStrategy "RollingUpdate" }}
+    rollingUpdate:
+      maxUnavailable: {{ .CephFSPluginUpdateStrategyMaxUnavailable }}
+    {{ end }}
   template:
     metadata:
       labels:
@@ -18,6 +22,7 @@ spec:
         {{ $key }}: "{{ $value }}"
         {{ end }}
     spec:
+      securityContext: {}
       serviceAccountName: rook-csi-cephfs-plugin-sa
       hostNetwork: {{ .EnableCSIHostNetwork }}
       {{ if .PluginPriorityClassName }}
@@ -33,7 +38,11 @@ spec:
           # created by privileged CSI driver container.
           securityContext:
             privileged: true
+            capabilities:
+              add: []
+              drop: ["ALL"]
           image: {{ .RegistrarImage }}
+          imagePullPolicy: {{ .ImagePullPolicy }}
           args:
             - "--v={{ .LogLevel }}"
             - "--csi-address=/csi/csi.sock"
@@ -53,6 +62,7 @@ spec:
             privileged: true
             capabilities:
               add: ["SYS_ADMIN"]
+              drop: ["ALL"]
             allowPrivilegeEscalation: true
           image: {{ .CSIPluginImage }}
           args:
@@ -63,10 +73,15 @@ spec:
             - "--nodeserver=true"
             - "--drivername={{ .DriverNamePrefix }}cephfs.csi.ceph.com"
             - "--pidlimit=-1"
-            - "--metricsport={{ .CephFSGRPCMetricsPort }}"
             - "--forcecephkernelclient={{ .ForceCephFSKernelClient }}"
-            - "--metricspath=/metrics"
-            - "--enablegrpcmetrics={{ .EnableCSIGRPCMetrics }}"
+            {{ if .CSILogRotation }}
+            - "--logtostderr=false"
+            - "--alsologtostderr=true"
+            - "--log_file={{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}/csi-cephfsplugin.log"
+            {{ end }}
+            {{ if .CephFSKernelMountOptions }}
+            - "--kernelmountoptions={{ .CephFSKernelMountOptions }}"
+            {{ end }}
           env:
             - name: POD_IP
               valueFrom:
@@ -82,10 +97,12 @@ spec:
                   fieldPath: metadata.namespace
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: {{ .ImagePullPolicy }}
           volumeMounts:
             - name: plugin-dir
               mountPath: /csi
+            - name: ceph-csi-mountinfo
+              mountPath: /csi/mountinfo
             - name: csi-plugins-dir
               mountPath: "{{ .KubeletDirPath }}/plugins"
               mountPropagation: "Bidirectional"
@@ -105,6 +122,10 @@ spec:
               mountPath: /tmp/csi/keys
             - name: host-run-mount
               mountPath: /run/mount
+            {{ if .CSILogRotation }}
+            - mountPath: {{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}
+              name: csi-log
+            {{ end }}
             {{ if .EnablePluginSelinuxHostMount }}
             -  name: etc-selinux
                mountPath: /etc/selinux
@@ -115,9 +136,17 @@ spec:
               mountPath: /etc/ceph/ceph.conf
               subPath: ceph.conf
             {{ end }}
+            {{ if .EnableCSIEncryption }}
+            - name: rook-ceph-csi-kms-config
+              mountPath: /etc/ceph-csi-encryption-kms-config/
+            {{ end }}
+        {{ if .EnableLiveness }}
         - name: liveness-prometheus
           securityContext:
             privileged: true
+            capabilities:
+              add: []
+              drop: ["ALL"]
           image: {{ .CSIPluginImage }}
           args:
             - "--type=liveness"
@@ -136,8 +165,13 @@ spec:
           volumeMounts:
             - name: plugin-dir
               mountPath: /csi
-          imagePullPolicy: "IfNotPresent"
+          imagePullPolicy: {{ .ImagePullPolicy }}
+        {{ end }}
       volumes:
+        - name: ceph-csi-mountinfo
+          hostPath:
+            path: "{{ .KubeletDirPath }}/plugins/{{ .DriverNamePrefix }}cephfs.csi.ceph.com/mountinfo"
+            type: DirectoryOrCreate
         - name: plugin-dir
           hostPath:
             path: "{{ .KubeletDirPath }}/plugins/{{ .DriverNamePrefix }}cephfs.csi.ceph.com/"
@@ -176,6 +210,15 @@ spec:
         - name: host-run-mount
           hostPath:
             path: /run/mount
+        {{ if .CSILogRotation }}
+        - name: csi-log
+          hostPath:
+            path: {{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}
+            type: DirectoryOrCreate
+        - name: csi-logs-logrotate
+          emptyDir:
+            type: DirectoryOrCreate
+        {{ end }}
         {{ if .EnablePluginSelinuxHostMount }}
         - name: etc-selinux
           hostPath:
@@ -188,4 +231,12 @@ spec:
             items:
             - key: ceph.conf
               path: ceph.conf
+        {{ end }}
+        {{ if .EnableCSIEncryption }}
+        - name: rook-ceph-csi-kms-config
+          configMap:
+            name: rook-ceph-csi-kms-config
+            items:
+            - key: config.json
+              path: config.json
         {{ end }}

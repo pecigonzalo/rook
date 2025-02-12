@@ -18,6 +18,7 @@ package bucket
 
 import (
 	"context"
+	"os"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,8 +31,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
-	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/object"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -54,6 +55,10 @@ type ReconcileBucket struct {
 // Add creates a new Ceph CSI Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
+	if os.Getenv(object.DisableOBCEnvVar) == "true" {
+		logger.Info("skip running Object Bucket controller")
+		return nil
+	}
 	return add(opManagerContext, mgr, newReconciler(mgr, context, opManagerContext, opConfig))
 }
 
@@ -76,15 +81,22 @@ func add(ctx context.Context, mgr manager.Manager, r reconcile.Reconciler) error
 	logger.Infof("%s successfully started", controllerName)
 
 	// Watch for ConfigMap (operator config)
-	err = c.Watch(&source.Kind{
-		Type: &v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController(ctx, mgr.GetClient()))
+	cmKind := source.Kind[client.Object](
+		mgr.GetCache(),
+		&v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}},
+		&handler.EnqueueRequestForObject{}, predicateController(ctx, mgr.GetClient()),
+	)
+	err = c.Watch(cmKind)
 	if err != nil {
 		return err
 	}
 
 	// Watch for CephCluster
-	err = c.Watch(&source.Kind{
-		Type: &cephv1.CephCluster{TypeMeta: metav1.TypeMeta{Kind: "CephCluster", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController(ctx, mgr.GetClient()))
+	clusterKind := source.Kind[client.Object](mgr.GetCache(),
+		&cephv1.CephCluster{TypeMeta: metav1.TypeMeta{Kind: "CephCluster", APIVersion: v1.SchemeGroupVersion.String()}},
+		&handler.EnqueueRequestForObject{}, predicateController(ctx, mgr.GetClient()),
+	)
+	err = c.Watch(clusterKind)
 	if err != nil {
 		return err
 	}
@@ -148,11 +160,11 @@ func (r *ReconcileBucket) reconcile(request reconcile.Request) (reconcile.Result
 	}
 
 	// Populate clusterInfo during each reconcile
-	clusterInfo, _, _, err := mon.LoadClusterInfo(r.context, r.opManagerContext, cephCluster.Namespace)
+	clusterInfo, _, _, err := opcontroller.LoadClusterInfo(r.context, r.opManagerContext, cephCluster.Namespace, &cephCluster.Spec)
 	if err != nil {
 		// This avoids a requeue with exponential backoff and allows the controller to reconcile
 		// more quickly when the cluster is ready.
-		if errors.Is(err, mon.ClusterInfoNoClusterNoSecret) {
+		if errors.Is(err, opcontroller.ClusterInfoNoClusterNoSecret) {
 			return opcontroller.WaitForRequeueIfOperatorNotInitialized, nil
 		}
 		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to populate cluster info")

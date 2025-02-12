@@ -27,7 +27,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,21 +49,21 @@ func New(t *testing.T, nodes int) *fake.Clientset {
 // AddReadyNode adds a new Node with status "Ready" and the given name and IP.
 func AddReadyNode(t *testing.T, clientset *fake.Clientset, name, ip string) {
 	t.Helper()
-	ready := v1.NodeCondition{Type: v1.NodeReady, Status: v1.ConditionTrue}
-	n := &v1.Node{
+	ready := corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue}
+	n := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
 				corev1.LabelHostname: name,
 			},
 			Name: name,
 		},
-		Status: v1.NodeStatus{
-			Conditions: []v1.NodeCondition{
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
 				ready,
 			},
-			Addresses: []v1.NodeAddress{
+			Addresses: []corev1.NodeAddress{
 				{
-					Type:    v1.NodeInternalIP,
+					Type:    corev1.NodeInternalIP,
 					Address: ip,
 				},
 			},
@@ -80,8 +79,8 @@ func AddReadyNode(t *testing.T, clientset *fake.Clientset, name, ip string) {
 }
 
 // AddSomeReadyNodes create a number of new, ready Nodes.
-//  - name from 0 to count-1
-//  - ip from 0.0.0.0 to <count-1>.<count-1>.<count-1>.<count-1>
+//   - name from 0 to count-1
+//   - ip from 0.0.0.0 to <count-1>.<count-1>.<count-1>.<count-1>
 func AddSomeReadyNodes(t *testing.T, clientset *fake.Clientset, count int) {
 	t.Helper()
 	for i := 0; i < count; i++ {
@@ -127,7 +126,7 @@ var (
 
 // NewComplexClientset is a reusable clientset for Rook unit tests that adds some complex behavior
 // to the clientset to mimic more of what K8s does in the real world.
-//  - Generate a name for resources that have 'generateName' set and 'name' unset.
+//   - Generate a name for resources that have 'generateName' set and 'name' unset.
 func NewComplexClientset(t *testing.T) *fake.Clientset {
 	t.Helper()
 	clientset := fake.NewSimpleClientset()
@@ -142,6 +141,9 @@ func NewComplexClientset(t *testing.T) *fake.Clientset {
 		}
 		obj := createAction.GetObject()
 		objMeta, err := meta.Accessor(obj)
+		if err != nil {
+			panic(fmt.Errorf("failed to objMeta"))
+		}
 		resource := action.GetResource().Resource
 		name := objMeta.GetName()
 
@@ -170,11 +172,11 @@ func NewComplexClientset(t *testing.T) *fake.Clientset {
 // PrependComplexJobReactor adds a Job reactor with the below behavior. If more or different
 // functionality than this is needed for a test, either make a custom Job reactor or add more
 // optional behavior to this reactor.
-//  - When a Job is created, create the Pod for the Job based on the Job's Pod template
-//  - Created pod.Name = "[job name]-[pod name in job template]"
-//  - When a Job is deleted, delete the Pod for the Job (Pod delete will not be handled by reactors)
-//  - Pod create/delete is done to the clientset tracker, so no Pod watch events will register.
-//  - Optionally look through the clientset Nodes to randomly assign created Pods to a node.
+//   - When a Job is created, create the Pod for the Job based on the Job's Pod template
+//   - Created pod.Name = "[job name]-[pod name in job template]"
+//   - When a Job is deleted, delete the Pod for the Job (Pod delete will not be handled by reactors)
+//   - Pod create/delete is done to the clientset tracker, so no Pod watch events will register.
+//   - Optionally look through the clientset Nodes to randomly assign created Pods to a node.
 func PrependComplexJobReactor(t *testing.T, clientset *fake.Clientset, assignPodToNode bool) {
 	t.Helper()
 	var jobReactor k8stesting.ReactionFunc = func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
@@ -297,4 +299,27 @@ func FakeReplicaSet(ns string) *appsv1.ReplicaSet {
 	}
 
 	return r
+}
+
+func FakeCustomisePodCreate(t *testing.T, clientset *fake.Clientset, name, ns string, label map[string]string) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "Deployment",
+				},
+			},
+			Labels: label,
+		},
+	}
+	err := clientset.Tracker().Create(podGVR, pod, ns)
+	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			t.Logf("pod %q is already created", pod.GetName())
+		}
+		panic(fmt.Errorf("failed to create Pod %q. %v", pod.Name, err))
+	}
+	t.Logf("job reactor: created pod %q ", pod.Name)
 }

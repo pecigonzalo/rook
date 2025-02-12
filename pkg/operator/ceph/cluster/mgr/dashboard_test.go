@@ -29,6 +29,7 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -113,13 +114,13 @@ func TestStartSecureDashboard(t *testing.T) {
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "myns",
-		CephVersion: cephver.Octopus,
+		CephVersion: cephver.Squid,
 		OwnerInfo:   ownerInfo,
 		Context:     ctx,
 	}
 	c := &Cluster{clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
 		spec: cephv1.ClusterSpec{
-			Dashboard:   cephv1.DashboardSpec{Port: dashboardPortHTTP, Enabled: true, SSL: true},
+			Dashboard:   cephv1.DashboardSpec{Port: 443, Enabled: true, SSL: true},
 			CephVersion: cephv1.CephVersionSpec{Image: "quay.io/ceph/ceph:v15"},
 		},
 	}
@@ -131,7 +132,7 @@ func TestStartSecureDashboard(t *testing.T) {
 	}
 
 	dashboardInitWaitTime = 0
-	err := c.configureDashboardService("a")
+	err := c.configureDashboardService()
 	assert.NoError(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -143,10 +144,12 @@ func TestStartSecureDashboard(t *testing.T) {
 	svc, err := c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
 	assert.Nil(t, err)
 	assert.NotNil(t, svc)
+	assert.Equal(t, 443, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].TargetPort.IntVal))
 
 	// disable the dashboard
 	c.spec.Dashboard.Enabled = false
-	err = c.configureDashboardService("a")
+	err = c.configureDashboardService()
 	assert.Nil(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -156,26 +159,29 @@ func TestStartSecureDashboard(t *testing.T) {
 	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
 	assert.NotNil(t, err)
 	assert.True(t, kerrors.IsNotFound(err))
-	assert.Nil(t, svc)
-}
+	assert.Equal(t, svc, &v1.Service{})
 
-func TestFileBasedPasswordSupported(t *testing.T) {
-	clusterInfo := &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}
-	value := FileBasedPasswordSupported(clusterInfo)
-	assert.False(t, value)
+	// Set the port to something over 1024 and confirm the port and targetPort are the same
+	c.spec.Dashboard.Enabled = true
+	c.spec.Dashboard.Port = 1025
+	err = c.configureDashboardService()
+	assert.Nil(t, err)
 
-	// for Ceph version Octopus 15.2.10
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 10}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.NotNil(t, svc)
+	assert.Equal(t, 1025, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 1025, int(svc.Spec.Ports[0].TargetPort.IntVal))
 
-	// for Ceph version Pacific
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 0, Extra: 0}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	// Fall back to the default port
+	c.spec.Dashboard.Enabled = true
+	c.spec.Dashboard.Port = 0
+	err = c.configureDashboardService()
+	assert.Nil(t, err)
 
-	// for Ceph version Quincy
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 17, Minor: 0, Extra: 0}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.NotNil(t, svc)
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].TargetPort.IntVal))
 }

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
@@ -29,6 +30,7 @@ import (
 	"github.com/rook/rook/pkg/util/exec"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestExtractJson(t *testing.T) {
@@ -151,7 +153,7 @@ func TestRunAdminCommandNoMultisite(t *testing.T) {
 	})
 
 	t.Run("with multus - we use the remote executor", func(t *testing.T) {
-		objContext.CephClusterSpec = v1.ClusterSpec{Network: v1.NetworkSpec{Provider: "multus"}}
+		objContext.clusterInfo.NetworkSpec = v1.NetworkSpec{Provider: "multus"}
 		_, err := RunAdminCommandNoMultisite(objContext, true, []string{"zone", "get"}...)
 		assert.Error(t, err)
 
@@ -406,7 +408,7 @@ const firstPeriodUpdate = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80"
                 ],
@@ -489,7 +491,7 @@ const secondPeriodGet = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80"
                 ],
@@ -562,7 +564,7 @@ const secondPeriodGet = `{
 // example real-world output from 'radosgw-admin period update' after the first period commit,
 // and with no changes since the first commit
 // note: output was modified to increment the epoch to make sure this code works in case the "epoch"
-//       behavior changes in radosgw-admin in the future
+// behavior changes in radosgw-admin in the future
 const secondPeriodUpdateWithoutChanges = `{
     "id": "94ba560d-a560-431d-8ed4-85a2891f9122:staging",
     "epoch": 2,
@@ -575,7 +577,7 @@ const secondPeriodUpdateWithoutChanges = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80"
                 ],
@@ -659,7 +661,7 @@ const secondPeriodUpdateWithChanges = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80",
                     "https://10.105.59.166:443"
@@ -730,3 +732,135 @@ const secondPeriodUpdateWithChanges = `{
     "realm_name": "my-store",
     "realm_epoch": 3
 }`
+
+func TestGetAdminOpsEndpoint(t *testing.T) {
+	s := &cephv1.CephObjectStore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-store",
+			Namespace: "my-ns",
+		},
+		Spec: cephv1.ObjectStoreSpec{
+			Gateway: cephv1.GatewaySpec{},
+			Hosting: &cephv1.ObjectStoreHostingSpec{
+				// dnsNames shouldn't affect admin ops endpoints
+				DNSNames: []string{"should.not.appear"},
+			},
+		},
+	}
+
+	t.Run("internal", func(t *testing.T) {
+		t.Run("port", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.Port = 8080
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "http://rook-ceph-rgw-my-store.my-ns.svc:8080", got)
+		})
+
+		t.Run("securePort, no cert", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.SecurePort = 8443
+			got, err := GetAdminOpsEndpoint(s)
+			assert.Error(t, err)
+			assert.Equal(t, "", got)
+		})
+
+		t.Run("securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://rook-ceph-rgw-my-store.my-ns.svc:8443", got)
+		})
+
+		t.Run("port + securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.Port = 8080
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://rook-ceph-rgw-my-store.my-ns.svc:8443", got)
+		})
+	})
+
+	t.Run("external", func(t *testing.T) {
+		t.Run("port", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.Port = 8080
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "http://192.168.1.1:8080", got)
+		})
+
+		t.Run("securePort, no cert", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.SecurePort = 8443
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.Error(t, err)
+			assert.Equal(t, "", got)
+		})
+
+		t.Run("securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://192.168.1.1:8443", got)
+		})
+
+		t.Run("port + securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.Port = 8080
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://192.168.1.1:8443", got)
+		})
+	})
+
+	t.Run("advertise", func(t *testing.T) {
+		t.Run("port + securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.Port = 8080
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+			s.Spec.Hosting.AdvertiseEndpoint = &cephv1.ObjectEndpointSpec{
+				DnsName: "advertise.me",
+				Port:    80,
+				UseTls:  false,
+			}
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "http://advertise.me:80", got)
+		})
+	})
+}

@@ -21,11 +21,14 @@ import (
 	"testing"
 	"time"
 
+	addonsv1alpha1 "github.com/csi-addons/kubernetes-csi-addons/api/csiaddons/v1alpha1"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	apifake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +38,6 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -50,10 +52,15 @@ func TestReconcileDeleteCephCluster(t *testing.T) {
 	}
 
 	fakeCluster := &cephv1.CephCluster{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "CephCluster",
+			APIVersion: "ceph.rook.io/v1",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              clusterName,
 			Namespace:         cephNs,
 			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Finalizers:        []string{"cephcluster.ceph.rook.io"},
 		},
 	}
 
@@ -71,11 +78,14 @@ func TestReconcileDeleteCephCluster(t *testing.T) {
 	// create a Rook-Ceph scheme to use for our tests
 	scheme := runtime.NewScheme()
 	assert.NoError(t, cephv1.AddToScheme(scheme))
+	assert.NoError(t, addonsv1alpha1.AddToScheme(scheme))
 
 	t.Run("deletion blocked while dependencies exist", func(t *testing.T) {
 		// set up clusterd.Context
 		clusterdCtx := &clusterd.Context{
-			Clientset: k8sfake.NewSimpleClientset(),
+			Clientset:           k8sfake.NewSimpleClientset(),
+			RookClientset:       rookclient.NewSimpleClientset(),
+			ApiExtensionsClient: apifake.NewSimpleClientset(),
 		}
 
 		// create the cluster controller and tell it that the cluster has been deleted
@@ -183,7 +193,7 @@ func TestRemoveFinalizers(t *testing.T) {
 				tt.object,
 			}
 			s.AddKnownTypes(tt.schema, tt.object)
-			cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+			cl := clientfake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 			assert.NotEmpty(t, fakeObject.GetFinalizers())
 			name := types.NamespacedName{Name: fakeObject.GetName(), Namespace: fakeObject.GetNamespace()}

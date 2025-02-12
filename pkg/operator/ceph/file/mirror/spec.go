@@ -42,10 +42,12 @@ func (r *ReconcileFilesystemMirror) makeDeployment(daemonConfig *daemonConfig, f
 			Containers: []v1.Container{
 				r.makeFsMirroringDaemonContainer(daemonConfig, fsMirror),
 			},
-			RestartPolicy:     v1.RestartPolicyAlways,
-			Volumes:           controller.DaemonVolumes(daemonConfig.DataPathMap, daemonConfig.ResourceName),
-			HostNetwork:       r.cephClusterSpec.Network.IsHost(),
-			PriorityClassName: fsMirror.Spec.PriorityClassName,
+			RestartPolicy:      v1.RestartPolicyAlways,
+			Volumes:            controller.DaemonVolumes(daemonConfig.DataPathMap, daemonConfig.ResourceName, r.cephClusterSpec.DataDirHostPath),
+			HostNetwork:        r.cephClusterSpec.Network.IsHost(),
+			PriorityClassName:  fsMirror.Spec.PriorityClassName,
+			SecurityContext:    &v1.PodSecurityContext{},
+			ServiceAccountName: k8sutil.DefaultServiceAccount,
 		},
 	}
 
@@ -64,7 +66,7 @@ func (r *ReconcileFilesystemMirror) makeDeployment(daemonConfig *daemonConfig, f
 	if r.cephClusterSpec.Network.IsHost() {
 		podSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	} else if r.cephClusterSpec.Network.IsMultus() {
-		if err := k8sutil.ApplyMultus(r.cephClusterSpec.Network, &podSpec.ObjectMeta); err != nil {
+		if err := k8sutil.ApplyMultus(r.clusterInfo.Namespace, &r.cephClusterSpec.Network, &podSpec.ObjectMeta); err != nil {
 			return nil, err
 		}
 	}
@@ -78,6 +80,7 @@ func (r *ReconcileFilesystemMirror) makeDeployment(daemonConfig *daemonConfig, f
 			Annotations: fsMirror.Spec.Annotations,
 			Labels:      controller.CephDaemonAppLabels(AppName, fsMirror.Namespace, config.FilesystemMirrorType, userID, fsMirror.Name, "cephfilesystemmirrors.ceph.rook.io", true)},
 		Spec: apps.DeploymentSpec{
+			RevisionHistoryLimit: controller.RevisionHistoryLimit(),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: podSpec.Labels,
 			},
@@ -97,9 +100,11 @@ func (r *ReconcileFilesystemMirror) makeChownInitContainer(daemonConfig *daemonC
 	return controller.ChownCephDataDirsInitContainer(
 		*daemonConfig.DataPathMap,
 		r.cephClusterSpec.CephVersion.Image,
-		controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName),
+		controller.GetContainerImagePullPolicy(r.cephClusterSpec.CephVersion.ImagePullPolicy),
+		controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName, r.cephClusterSpec.DataDirHostPath),
 		fsMirror.Spec.Resources,
 		controller.PodSecurityContext(),
+		"",
 	)
 }
 
@@ -115,8 +120,9 @@ func (r *ReconcileFilesystemMirror) makeFsMirroringDaemonContainer(daemonConfig 
 			"--name="+user,
 		),
 		Image:           r.cephClusterSpec.CephVersion.Image,
-		VolumeMounts:    controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName),
-		Env:             controller.DaemonEnvVars(r.cephClusterSpec.CephVersion.Image),
+		ImagePullPolicy: controller.GetContainerImagePullPolicy(r.cephClusterSpec.CephVersion.ImagePullPolicy),
+		VolumeMounts:    controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName, r.cephClusterSpec.DataDirHostPath),
+		Env:             controller.DaemonEnvVars(r.cephClusterSpec),
 		Resources:       fsMirror.Spec.Resources,
 		SecurityContext: controller.PodSecurityContext(),
 		// TODO:

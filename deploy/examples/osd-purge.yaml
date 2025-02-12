@@ -1,5 +1,5 @@
 #################################################################################################################
-# We need many operations to remove OSDs as written in Documentation/ceph-osd-mgmt.md.
+# We need many operations to remove OSDs as written in Documentation/Storage-Configuration/Advanced/ceph-osd-mgmt.md.
 # This job can automate some of that operations: mark OSDs as `out`, purge these OSDs,
 # and delete the corresponding resources like OSD deployments, OSD prepare jobs, and PVCs.
 #
@@ -28,7 +28,7 @@ spec:
       serviceAccountName: rook-ceph-purge-osd
       containers:
         - name: osd-removal
-          image: rook/ceph:master
+          image: docker.io/rook/ceph:master
           # TODO: Insert the OSD ID in the last parameter that is to be removed
           # The OSD IDs are a comma-separated list. For example: "0" or "0,2".
           # If you want to preserve the OSD PVCs, set `--preserve-pvc true`.
@@ -60,11 +60,6 @@ spec:
                 secretKeyRef:
                   key: ceph-username
                   name: rook-ceph-mon
-            - name: ROOK_CEPH_SECRET
-              valueFrom:
-                secretKeyRef:
-                  key: ceph-secret
-                  name: rook-ceph-mon
             - name: ROOK_CONFIG_DIR
               value: /var/lib/rook
             - name: ROOK_CEPH_CONFIG_OVERRIDE
@@ -81,7 +76,16 @@ spec:
               name: ceph-conf-emptydir
             - mountPath: /var/lib/rook
               name: rook-config
+            - name: ceph-admin-secret
+              mountPath: /var/lib/rook-ceph-mon
       volumes:
+        - name: ceph-admin-secret
+          secret:
+            secretName: rook-ceph-mon
+            optional: false
+            items:
+              - key: ceph-secret
+                path: secret.keyring
         - emptyDir: {}
           name: ceph-conf-emptydir
         - emptyDir: {}

@@ -30,6 +30,7 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -67,6 +68,10 @@ func NewConfig(context *clusterd.Context, clusterSpec *cephv1.ClusterSpec, clust
 		config.Provider = secrets.TypeVault
 	case TypeIBM:
 		config.Provider = TypeIBM
+	case TypeKMIP:
+		config.Provider = TypeKMIP
+	case secrets.TypeAzure:
+		config.Provider = secrets.TypeAzure
 	default:
 		logger.Errorf("unsupported kms type %q", Provider)
 	}
@@ -91,7 +96,7 @@ func (c *Config) PutSecret(secretName, secretValue string) error {
 			return errors.Wrap(err, "failed to init vault kms")
 		}
 		k := buildVaultKeyContext(c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
-		err = put(v, GenerateOSDEncryptionSecretName(secretName), secretValue, k)
+		err = putSecret(v, GenerateOSDEncryptionSecretName(secretName), secretValue, k)
 		if err != nil {
 			return errors.Wrap(err, "failed to put secret in vault")
 		}
@@ -114,6 +119,44 @@ func (c *Config) PutSecret(secretName, secretValue string) error {
 			return errors.Wrap(err, "failed to put secret in ibm key protect")
 		}
 	}
+	if c.IsKMIP() {
+		_, err := c.getKubernetesSecret(secretName)
+		if err == nil {
+			// if error is nil, secret exists, just return nil.
+			return nil
+		}
+		// if error is not found, continue with creation.
+		if !kerrors.IsNotFound(err) {
+			return errors.Wrapf(err, "failed to check secret exists for %q", secretName)
+		}
+
+		kmip, err := InitKMIP(c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		if err != nil {
+			return errors.Wrap(err, "failed to init kmip")
+		}
+
+		// register the key with kmip server.
+		uniqueIdentifier, err := kmip.registerKey(secretName, secretValue)
+		if err != nil {
+			return errors.Wrap(err, "failed to register secret in kmip")
+		}
+		// store the uniqueIdentifier in Kubernetes Secret.
+		err = c.storeSecretInKubernetes(secretName, uniqueIdentifier)
+		if err != nil {
+			return errors.Wrap(err, "failed to store unique identifier in kubernetes secret")
+		}
+	}
+
+	if c.IsAzure() {
+		v, err := InitAzure(c.ClusterInfo.Context, c.context, c.ClusterInfo.Namespace, c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		if err != nil {
+			return errors.Wrap(err, "failed to init azure key vault")
+		}
+		err = putSecret(v, GenerateOSDEncryptionSecretName(secretName), secretValue, map[string]string{})
+		if err != nil {
+			return errors.Wrap(err, "failed to put secret in azure key vault")
+		}
+	}
 
 	return nil
 }
@@ -121,15 +164,23 @@ func (c *Config) PutSecret(secretName, secretValue string) error {
 // GetSecret returns an encrypted key from a KMS
 func (c *Config) GetSecret(secretName string) (string, error) {
 	var value string
+	if c.IsK8s() {
+		// Retrieve the secret from Kubernetes Secrets
+		value, err := c.getKubernetesSecret(secretName)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get secret from kubernetes secret")
+		}
+		return value, nil
+	}
 	if c.IsVault() {
-		// Store the secret in Vault
+		// Retrieve the secret from Vault
 		v, err := InitVault(c.ClusterInfo.Context, c.context, c.ClusterInfo.Namespace, c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
 		if err != nil {
 			return "", errors.Wrap(err, "failed to init vault")
 		}
 
 		k := buildVaultKeyContext(c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
-		value, err = get(v, GenerateOSDEncryptionSecretName(secretName), k)
+		value, err = getSecret(v, GenerateOSDEncryptionSecretName(secretName), k)
 		if err != nil {
 			return "", errors.Wrap(err, "failed to get secret from vault")
 		}
@@ -145,8 +196,69 @@ func (c *Config) GetSecret(secretName string) (string, error) {
 		}
 		value = string(keyObject.Payload)
 	}
+	if c.IsKMIP() {
+		uniqueIdentifier, err := c.getKubernetesSecret(secretName)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get unique id")
+		}
+
+		kmip, err := InitKMIP(c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to init kmip")
+		}
+
+		value, err = kmip.getKey(uniqueIdentifier)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get key from kmip")
+		}
+	}
+	if c.IsAzure() {
+		v, err := InitAzure(c.ClusterInfo.Context, c.context, c.ClusterInfo.Namespace, c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to init azure key vault")
+		}
+		value, err = getSecret(v, GenerateOSDEncryptionSecretName(secretName), map[string]string{})
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get secret from azure key vault")
+		}
+	}
 
 	return value, nil
+}
+
+// UpdateSecret updates the encrypted key in a KMS
+func (c *Config) UpdateSecret(secretName, secretValue string) error {
+	// If Kubernetes Secret KMS is selected (default)
+	if c.IsK8s() {
+		// Update the secret in Kubernetes Secrets
+		err := c.updateSecretInKubernetes(secretName, secretValue)
+		if err != nil {
+			return errors.Wrap(err, "failed to update secret in kubernetes secret")
+		}
+
+		return nil
+	}
+	if c.IsVault() {
+		// Store the secret in Vault
+		v, err := InitVault(c.ClusterInfo.Context, c.context, c.ClusterInfo.Namespace, c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		if err != nil {
+			return errors.Wrap(err, "failed to init vault kms")
+		}
+		k := buildVaultKeyContext(c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		// Build Secret
+		secretName = GenerateOSDEncryptionSecretName(secretName)
+		data := make(map[string]interface{})
+		data[secretName] = secretValue
+
+		_, err = v.PutSecret(secretName, data, k)
+		if err != nil {
+			return errors.Wrapf(err, "failed to put secret %q in vault kms", secretName)
+		}
+
+		return nil
+	}
+
+	return errors.Errorf("update secret is not supported for the %q KMS", c.Provider)
 }
 
 // DeleteSecret deletes an encrypted key from a KMS
@@ -196,6 +308,33 @@ func (c *Config) DeleteSecret(secretName string) error {
 			return errors.Wrap(err, "failed to delete secret in ibm key protect")
 		}
 	}
+	if c.IsKMIP() {
+		uniqueIdentifier, err := c.getKubernetesSecret(secretName)
+		if err != nil {
+			return errors.Wrap(err, "failed to get unique id")
+		}
+		kmip, err := InitKMIP(c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		if err != nil {
+			return errors.Wrap(err, "failed to init kmip")
+		}
+
+		err = kmip.deleteKey(uniqueIdentifier)
+		if err != nil {
+			return errors.Wrap(err, "failed to delete key with kmip")
+		}
+	}
+
+	if c.IsAzure() {
+		v, err := InitAzure(c.ClusterInfo.Context, c.context, c.ClusterInfo.Namespace, c.clusterSpec.Security.KeyManagementService.ConnectionDetails)
+		if err != nil {
+			return errors.Wrap(err, "failed to init azure key vault")
+		}
+		err = deleteSecret(v, GenerateOSDEncryptionSecretName(secretName), map[string]string{})
+		if err != nil {
+			return errors.Wrap(err, "failed to delete secret from azure key vault")
+		}
+
+	}
 
 	return nil
 }
@@ -209,29 +348,31 @@ func GetParam(kmsConfig map[string]string, param string) string {
 }
 
 // ValidateConnectionDetails validates mandatory KMS connection details
-func ValidateConnectionDetails(ctx context.Context, clusterdContext *clusterd.Context, securitySpec *cephv1.SecuritySpec, ns string) error {
+func ValidateConnectionDetails(ctx context.Context, clusterdContext *clusterd.Context, kms *cephv1.KeyManagementServiceSpec, ns string) error {
 	// Lookup mandatory connection details
 	for _, config := range kmsMandatoryConnectionDetails {
-		if GetParam(securitySpec.KeyManagementService.ConnectionDetails, config) == "" {
+		if GetParam(kms.ConnectionDetails, config) == "" {
 			return errors.Errorf("failed to validate kms config %q. cannot be empty", config)
 		}
 	}
 
-	// A token must be specified if token-auth is used
-	if !securitySpec.KeyManagementService.IsK8sAuthEnabled() && securitySpec.KeyManagementService.TokenSecretName == "" {
-		if !securitySpec.KeyManagementService.IsTokenAuthEnabled() {
-			return errors.New("failed to validate kms configuration (missing token in spec)")
+	// A token must be specified if token-auth is used for KMS other than Azure
+	if !kms.IsAzureMS() {
+		if !kms.IsK8sAuthEnabled() && kms.TokenSecretName == "" {
+			if !kms.IsTokenAuthEnabled() {
+				return errors.New("failed to validate kms configuration (missing token in spec)")
+			}
 		}
 	}
 
 	// KMS provider must be specified
-	provider := GetParam(securitySpec.KeyManagementService.ConnectionDetails, Provider)
+	provider := GetParam(kms.ConnectionDetails, Provider)
 
 	// Validate potential token Secret presence
-	if securitySpec.KeyManagementService.IsTokenAuthEnabled() {
-		kmsToken, err := clusterdContext.Clientset.CoreV1().Secrets(ns).Get(ctx, securitySpec.KeyManagementService.TokenSecretName, metav1.GetOptions{})
+	if kms.IsTokenAuthEnabled() {
+		kmsToken, err := clusterdContext.Clientset.CoreV1().Secrets(ns).Get(ctx, kms.TokenSecretName, metav1.GetOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "failed to fetch kms token secret %q", securitySpec.KeyManagementService.TokenSecretName)
+			return errors.Wrapf(err, "failed to fetch kms token secret %q", kms.TokenSecretName)
 		}
 
 		switch provider {
@@ -239,7 +380,7 @@ func ValidateConnectionDetails(ctx context.Context, clusterdContext *clusterd.Co
 			// Check for empty token
 			token, ok := kmsToken.Data[KMSTokenSecretNameKey]
 			if !ok || len(token) == 0 {
-				return errors.Errorf("failed to read k8s kms secret %q key %q (not found or empty)", KMSTokenSecretNameKey, securitySpec.KeyManagementService.TokenSecretName)
+				return errors.Errorf("failed to read k8s kms secret %q key %q (not found or empty)", KMSTokenSecretNameKey, kms.TokenSecretName)
 			}
 
 			// Set the env variable
@@ -252,10 +393,20 @@ func ValidateConnectionDetails(ctx context.Context, clusterdContext *clusterd.Co
 			for _, config := range kmsIBMKeyProtectMandatoryTokenDetails {
 				v, ok := kmsToken.Data[config]
 				if !ok || len(v) == 0 {
-					return errors.Errorf("failed to read k8s kms secret %q key %q (not found or empty)", config, securitySpec.KeyManagementService.TokenSecretName)
+					return errors.Errorf("failed to read k8s kms secret %q key %q (not found or empty)", config, kms.TokenSecretName)
 				}
 				// Append the token secret details to the connection details
-				securitySpec.KeyManagementService.ConnectionDetails[config] = strings.TrimSuffix(strings.TrimSpace(string(v)), "\n")
+				kms.ConnectionDetails[config] = strings.TrimSuffix(strings.TrimSpace(string(v)), "\n")
+			}
+
+		case TypeKMIP:
+			for _, config := range kmsKMIPMandatoryTokenDetails {
+				v, ok := kmsToken.Data[config]
+				if !ok || len(v) == 0 {
+					return errors.Errorf("failed to read k8s kms secret %q key %q (not found or empty)", config, kms.TokenSecretName)
+				}
+				// Append the token secret details to the connection details
+				kms.ConnectionDetails[config] = strings.TrimSuffix(strings.TrimSpace(string(v)), "\n")
 			}
 		}
 	}
@@ -263,27 +414,41 @@ func ValidateConnectionDetails(ctx context.Context, clusterdContext *clusterd.Co
 	// Validate KMS provider connection details for each provider
 	switch provider {
 	case secrets.TypeVault:
-		err := validateVaultConnectionDetails(ctx, clusterdContext, ns, securitySpec.KeyManagementService.ConnectionDetails)
+		err := validateVaultConnectionDetails(ctx, clusterdContext, ns, kms.ConnectionDetails)
 		if err != nil {
 			return errors.Wrap(err, "failed to validate vault connection details")
 		}
 
-		secretEngine := securitySpec.KeyManagementService.ConnectionDetails[VaultSecretEngineKey]
+		secretEngine := kms.ConnectionDetails[VaultSecretEngineKey]
 		switch secretEngine {
 		case VaultKVSecretEngineKey:
 			// Append Backend Version if not already present
-			if GetParam(securitySpec.KeyManagementService.ConnectionDetails, vault.VaultBackendKey) == "" {
-				backendVersion, err := BackendVersion(ctx, clusterdContext, ns, securitySpec.KeyManagementService.ConnectionDetails)
+			if GetParam(kms.ConnectionDetails, vault.VaultBackendKey) == "" {
+				backendVersion, err := BackendVersion(ctx, clusterdContext, ns, kms.ConnectionDetails)
 				if err != nil {
 					return errors.Wrap(err, "failed to get backend version")
 				}
-				securitySpec.KeyManagementService.ConnectionDetails[vault.VaultBackendKey] = backendVersion
+				kms.ConnectionDetails[vault.VaultBackendKey] = backendVersion
 			}
 		}
 
 	case TypeIBM:
 		for _, config := range kmsIBMKeyProtectMandatoryConnectionDetails {
-			if GetParam(securitySpec.KeyManagementService.ConnectionDetails, config) == "" {
+			if GetParam(kms.ConnectionDetails, config) == "" {
+				return errors.Errorf("failed to validate kms config %q. cannot be empty", config)
+			}
+		}
+
+	case TypeKMIP:
+		for _, config := range kmsKMIPMandatoryConnectionDetails {
+			if GetParam(kms.ConnectionDetails, config) == "" {
+				return errors.Errorf("failed to validate kms config %q. cannot be empty", config)
+			}
+		}
+
+	case secrets.TypeAzure:
+		for _, config := range kmsAzureManadatoryConnectionDetails {
+			if GetParam(kms.ConnectionDetails, config) == "" {
 				return errors.Errorf("failed to validate kms config %q. cannot be empty", config)
 			}
 		}
@@ -318,6 +483,53 @@ func SetTokenToEnvVar(ctx context.Context, clusterdContext *clusterd.Context, to
 	err = os.Setenv(key, value)
 	if err != nil {
 		return errors.Wrap(err, "failed to set kms token to an env var")
+	}
+
+	return nil
+}
+
+func putSecret(v secrets.Secrets, secretName, secretValue string, keyContext map[string]string) error {
+	// First we must see if the key entry already exists, if it does we do nothing
+	key, err := getSecret(v, secretName, keyContext)
+	if err != nil && err != secrets.ErrInvalidSecretId && err != secrets.ErrSecretNotFound {
+		return errors.Wrapf(err, "failed to get secret %q in kms", secretName)
+	}
+	if key != "" {
+		logger.Debugf("key %q already exists in kms!", secretName)
+		if key != secretValue {
+			logger.Error("value for secret %q is not expected to be changed", secretName)
+		}
+		return nil
+	}
+
+	// Build Secret
+	data := make(map[string]interface{})
+	data[secretName] = secretValue
+
+	//nolint:gosec // Write the encryption key in Vault
+	_, err = v.PutSecret(secretName, data, keyContext)
+	if err != nil {
+		return errors.Wrapf(err, "failed to put secret %q in kms", secretName)
+	}
+
+	return nil
+}
+
+func getSecret(v secrets.Secrets, secretName string, keyContext map[string]string) (string, error) {
+	//nolint:gosec // Write the encryption key in Vault
+	s, _, err := v.GetSecret(secretName, keyContext)
+	if err != nil {
+		return "", err
+	}
+
+	return s[secretName].(string), nil
+}
+
+func deleteSecret(v secrets.Secrets, secretName string, keyContext map[string]string) error {
+	//nolint:gosec // Write the encryption key in Vault
+	err := v.DeleteSecret(secretName, keyContext)
+	if err != nil {
+		return errors.Wrapf(err, "failed to delete secret %q in vault", secretName)
 	}
 
 	return nil

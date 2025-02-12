@@ -37,29 +37,11 @@ func TestValidatePoolSpec(t *testing.T) {
 			},
 		},
 	}
-	err := validatePoolSpec(p.Spec.ToNamedPoolSpec())
+	err := validatePoolSpec(p.ToNamedPoolSpec())
 	assert.NoError(t, err)
 
 	p.Spec.ErasureCoded.DataChunks = 1
-	err = validatePoolSpec(p.Spec.ToNamedPoolSpec())
-	assert.Error(t, err)
-}
-
-func TestCephBlockPoolValidateUpdate(t *testing.T) {
-	p := &CephBlockPool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "ec-pool",
-		},
-		Spec: NamedBlockPoolSpec{
-			PoolSpec: PoolSpec{
-				Replicated: ReplicatedSpec{RequireSafeReplicaSize: true, Size: 3},
-			},
-		},
-	}
-	up := p.DeepCopy()
-	up.Spec.ErasureCoded.DataChunks = 2
-	up.Spec.ErasureCoded.CodingChunks = 1
-	err := up.ValidateUpdate(p)
+	err = validatePoolSpec(p.ToNamedPoolSpec())
 	assert.Error(t, err)
 }
 

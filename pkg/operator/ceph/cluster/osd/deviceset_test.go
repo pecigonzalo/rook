@@ -51,7 +51,7 @@ func testPrepareDeviceSets(t *testing.T, setTemplateName bool) {
 		Name:                 "mydata",
 		Count:                1,
 		Portable:             true,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{claim},
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{claim},
 		SchedulerName:        "custom-scheduler",
 	}
 	spec := cephv1.ClusterSpec{
@@ -83,6 +83,14 @@ func testPrepareDeviceSets(t *testing.T, setTemplateName bool) {
 	}
 	assert.Equal(t, fmt.Sprintf("mydata-%s-0", expectedName), pvcs.Items[0].GenerateName)
 	assert.Equal(t, cluster.clusterInfo.Namespace, pvcs.Items[0].Namespace)
+
+	//Verify that the PVC has correct Image Version Label
+	cephImageVersion := createValidImageVersionLabel(cluster.spec.CephVersion.Image)
+	for _, item := range pvcs.Items {
+		val, exist := item.Labels[CephImageLabelKey]
+		assert.Equal(t, true, exist)
+		assert.Equal(t, cephImageVersion, val)
+	}
 }
 
 func TestPrepareDeviceSetWithHolesInPVCs(t *testing.T) {
@@ -96,7 +104,7 @@ func TestPrepareDeviceSetWithHolesInPVCs(t *testing.T) {
 		Name:                 "mydata",
 		Count:                1,
 		Portable:             true,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{testVolumeClaim("data"), testVolumeClaim("metadata"), testVolumeClaim("wal")},
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{testVolumeClaim("data"), testVolumeClaim("metadata"), testVolumeClaim("wal")},
 		SchedulerName:        "custom-scheduler",
 	}
 	spec := cephv1.ClusterSpec{
@@ -223,9 +231,9 @@ func assertPVCExists(t *testing.T, clientset kubernetes.Interface, namespace, na
 	assert.NotNil(t, pvc)
 }
 
-func testVolumeClaim(name string) corev1.PersistentVolumeClaim {
+func testVolumeClaim(name string) cephv1.VolumeClaimTemplate {
 	storageClass := "mysource"
-	claim := corev1.PersistentVolumeClaim{Spec: corev1.PersistentVolumeClaimSpec{
+	claim := cephv1.VolumeClaimTemplate{Spec: corev1.PersistentVolumeClaimSpec{
 		StorageClassName: &storageClass,
 	}}
 	claim.Name = name
@@ -241,7 +249,7 @@ func TestPrepareDeviceSetsWithCrushParams(t *testing.T) {
 	deviceSet := cephv1.StorageClassDeviceSet{
 		Name:                 "datawithcrushparams1",
 		Count:                1,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{testVolumeClaim("testwithcrushparams1")},
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{testVolumeClaim("testwithcrushparams1")},
 		SchedulerName:        "custom-scheduler",
 	}
 	deviceSet.VolumeClaimTemplates[0].Annotations = map[string]string{
@@ -269,4 +277,27 @@ func TestPrepareDeviceSetsWithCrushParams(t *testing.T) {
 	pvcs, err := clientset.CoreV1().PersistentVolumeClaims(cluster.clusterInfo.Namespace).List(ctx, metav1.ListOptions{})
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(pvcs.Items))
+}
+
+func TestPVCName(t *testing.T) {
+	id := deviceSetPVCID("mydeviceset", "a", 0)
+	assert.Equal(t, "mydeviceset-a-0", id)
+
+	id = deviceSetPVCID("mydeviceset", "a", 10)
+	assert.Equal(t, "mydeviceset-a-10", id)
+
+	id = deviceSetPVCID("device-set", "a", 10)
+	assert.Equal(t, "device-set-a-10", id)
+
+	id = deviceSetPVCID("device.set.with.dots", "b", 10)
+	assert.Equal(t, "device-set-with-dots-b-10", id)
+}
+
+func TestCreateValidImageVersionLabel(t *testing.T) {
+	image := "ceph/ceph:v19.2.0"
+	assert.Equal(t, "ceph_ceph_v19.2.0", createValidImageVersionLabel(image))
+	image = "rook/ceph:master"
+	assert.Equal(t, "rook_ceph_master", createValidImageVersionLabel(image))
+	image = ".invalid_label"
+	assert.Equal(t, "", createValidImageVersionLabel(image))
 }

@@ -62,7 +62,7 @@ func Test_createNewOSDsFromStatus(t *testing.T) {
 	}()
 	createCallsOnNode := []int{}
 	induceFailureCreatingOSD := -1 // allow causing the create call to fail for a given OSD ID
-	createDaemonOnNodeFunc = func(c *Cluster, osd OSDInfo, nodeName string, config *provisionConfig) error {
+	createDaemonOnNodeFunc = func(c *Cluster, osd *OSDInfo, nodeName string, config *provisionConfig) error {
 		createCallsOnNode = append(createCallsOnNode, osd.ID)
 		if induceFailureCreatingOSD == osd.ID {
 			return errors.Errorf("createOSDDaemonOnNode: induced failure on OSD %d", osd.ID)
@@ -76,7 +76,7 @@ func Test_createNewOSDsFromStatus(t *testing.T) {
 	}()
 	createCallsOnPVC := []int{}
 	// reuse induceFailureCreatingOSD from above
-	createDaemonOnPVCFunc = func(c *Cluster, osd OSDInfo, pvcName string, config *provisionConfig) error {
+	createDaemonOnPVCFunc = func(c *Cluster, osd *OSDInfo, pvcName string, config *provisionConfig) error {
 		createCallsOnPVC = append(createCallsOnPVC, osd.ID)
 		if induceFailureCreatingOSD == osd.ID {
 			return errors.Errorf("createOSDDaemonOnNode: induced failure on OSD %d", osd.ID)
@@ -92,7 +92,7 @@ func Test_createNewOSDsFromStatus(t *testing.T) {
 
 	spec := cephv1.ClusterSpec{}
 	var status *OrchestrationStatus
-	awaitingStatusConfigMaps := sets.NewString()
+	awaitingStatusConfigMaps := sets.New[string]()
 
 	var c *Cluster
 	var createConfig *createConfig
@@ -101,7 +101,7 @@ func Test_createNewOSDsFromStatus(t *testing.T) {
 		// none of this code should ever add or remove deployments from the existence list
 		assert.Equal(t, 3, deployments.Len())
 		// Simulate environment where provision jobs were created for node0, node2, pvc1, and pvc2
-		awaitingStatusConfigMaps = sets.NewString()
+		awaitingStatusConfigMaps = sets.New[string]()
 		awaitingStatusConfigMaps.Insert(
 			statusNameNode0, statusNameNode2,
 			statusNamePVC1, statusNamePVC2)
@@ -310,22 +310,20 @@ func Test_startProvisioningOverPVCs(t *testing.T) {
 
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   namespace,
-		CephVersion: cephver.Octopus,
+		CephVersion: cephver.Squid,
 	}
 	clusterInfo.SetName("mycluster")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	clusterInfo.Context = context.TODO()
 
 	spec := cephv1.ClusterSpec{}
-	fakeK8sVersion := "v1.13.0"
 
 	var errs *provisionErrors
 	var c *Cluster
 	var config *provisionConfig
-	var awaitingStatusConfigMaps sets.String
+	var awaitingStatusConfigMaps sets.Set[string]
 	var err error
 	doSetup := func() {
-		test.SetFakeKubernetesVersion(clientset, fakeK8sVersion) // PVCs require k8s version v1.13+
 		errs = newProvisionErrors()
 		ctx := &clusterd.Context{
 			Clientset: clientset,
@@ -354,8 +352,8 @@ func Test_startProvisioningOverPVCs(t *testing.T) {
 					{
 						Name:  "set1",
 						Count: 0,
-						VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-							newDummyPVC("data", namespace, "10Gi", "gp2"),
+						VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{
+							newDummyPVC("data", namespace, "10Gi", "gp2-csi"),
 						},
 					},
 				},
@@ -379,8 +377,8 @@ func Test_startProvisioningOverPVCs(t *testing.T) {
 					{
 						Name:  "set1",
 						Count: 2,
-						VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-							newDummyPVC("data", namespace, "10Gi", "gp2"),
+						VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{
+							newDummyPVC("data", namespace, "10Gi", "gp2-csi"),
 						},
 					},
 				},
@@ -408,21 +406,6 @@ func Test_startProvisioningOverPVCs(t *testing.T) {
 		assert.Len(t, cms.Items, 2) // still just 2 configmaps should exist (the same 2 from before)
 	})
 
-	t.Run("error if k8s version not high enough", func(t *testing.T) {
-		// spec = <working spec from prior test>
-		clientset = test.NewComplexClientset(t) // reset to empty fake k8s environment
-		fakeK8sVersion = "v1.12.7"
-		doSetup()
-		awaitingStatusConfigMaps, err = c.startProvisioningOverPVCs(config, errs)
-		assert.NoError(t, err)
-		assert.Equal(t, 0, awaitingStatusConfigMaps.Len())
-		assert.Equal(t, 1, errs.len())
-		cms, err := clientset.CoreV1().ConfigMaps(namespace).List(context.TODO(), metav1.ListOptions{})
-		assert.NoError(t, err)
-		assert.Len(t, cms.Items, 0)
-		fakeK8sVersion = "v1.13.0"
-	})
-
 	t.Run("error if no volume claim template", func(t *testing.T) {
 		spec = cephv1.ClusterSpec{
 			Storage: cephv1.StorageScopeSpec{
@@ -430,7 +413,7 @@ func Test_startProvisioningOverPVCs(t *testing.T) {
 					{
 						Name:                 "set1",
 						Count:                2,
-						VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
+						VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{},
 					},
 				},
 			},
@@ -464,7 +447,7 @@ func Test_startProvisioningOverNodes(t *testing.T) {
 
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   namespace,
-		CephVersion: cephver.Octopus,
+		CephVersion: cephver.Squid,
 	}
 	clusterInfo.SetName("mycluster")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
@@ -476,7 +459,7 @@ func Test_startProvisioningOverNodes(t *testing.T) {
 	var errs *provisionErrors
 	var c *Cluster
 	var config *provisionConfig
-	var prepareJobsRun sets.String
+	var prepareJobsRun sets.Set[string]
 	var err error
 	var cms *corev1.ConfigMapList
 	doSetup := func() {
@@ -534,7 +517,7 @@ func Test_startProvisioningOverNodes(t *testing.T) {
 		assert.Zero(t, errs.len())
 		assert.ElementsMatch(t,
 			[]string{statusNameNode0, statusNameNode1, statusNameNode2},
-			prepareJobsRun.List(),
+			sets.List(prepareJobsRun),
 		)
 		// all result configmaps should have been created
 		cms, err = clientset.CoreV1().ConfigMaps(namespace).List(context.TODO(), metav1.ListOptions{})
@@ -553,7 +536,7 @@ func Test_startProvisioningOverNodes(t *testing.T) {
 		assert.Zero(t, errs.len())
 		assert.ElementsMatch(t,
 			[]string{statusNameNode0, statusNameNode1, statusNameNode2},
-			prepareJobsRun.List(),
+			sets.List(prepareJobsRun),
 		)
 	})
 
@@ -580,7 +563,7 @@ func Test_startProvisioningOverNodes(t *testing.T) {
 		assert.Zero(t, errs.len())
 		assert.ElementsMatch(t,
 			[]string{statusNameNode0, statusNameNode2},
-			prepareJobsRun.List(),
+			sets.List(prepareJobsRun),
 		)
 	})
 
@@ -646,25 +629,25 @@ func Test_startProvisioningOverNodes(t *testing.T) {
 		assert.Equal(t, 1, errs.len())
 		assert.ElementsMatch(t,
 			[]string{statusNameNode0},
-			prepareJobsRun.List(),
+			sets.List(prepareJobsRun),
 		)
 		// with a fresh clientset, only the one results ConfigMap should exist
 		cms, err = clientset.CoreV1().ConfigMaps(namespace).List(context.TODO(), metav1.ListOptions{})
 		assert.NoError(t, err)
 		assert.Len(t, cms.Items, 1)
-		assert.Equal(t, prepareJobsRun.List()[0], cms.Items[0].Name)
+		assert.Equal(t, sets.List(prepareJobsRun)[0], cms.Items[0].Name)
 	})
 }
 
-func newDummyPVC(name, namespace string, capacity string, storageClassName string) corev1.PersistentVolumeClaim {
+func newDummyPVC(name, namespace string, capacity string, storageClassName string) cephv1.VolumeClaimTemplate {
 	volMode := corev1.PersistentVolumeBlock
-	return corev1.PersistentVolumeClaim{
+	return cephv1.VolumeClaimTemplate{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			Resources: corev1.ResourceRequirements{
+			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceName(corev1.ResourceStorage): apiresource.MustParse(capacity),
 				},

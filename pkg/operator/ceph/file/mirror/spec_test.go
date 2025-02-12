@@ -25,6 +25,7 @@ import (
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/test"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -48,6 +49,7 @@ func TestPodSpec(t *testing.T) {
 			CephVersion: cephv1.CephVersionSpec{
 				Image: "quay.io/ceph/ceph:v16",
 			},
+			DataDirHostPath: "/var/lib/rook/",
 		},
 	}
 
@@ -72,7 +74,7 @@ func TestPodSpec(t *testing.T) {
 		TypeMeta: controllerTypeMeta,
 	}
 	clusterInfo := &cephclient.ClusterInfo{
-		CephVersion: cephver.Octopus,
+		CephVersion: cephver.Squid,
 	}
 	s := scheme.Scheme
 	object := []runtime.Object{fsMirror}
@@ -84,9 +86,10 @@ func TestPodSpec(t *testing.T) {
 	d, err := r.makeDeployment(&daemonConf, fsMirror)
 	assert.NoError(t, err)
 	assert.Equal(t, "rook-ceph-fs-mirror", d.Name)
-	assert.Equal(t, 4, len(d.Spec.Template.Spec.Volumes))
+	assert.Equal(t, 5, len(d.Spec.Template.Spec.Volumes))
 	assert.Equal(t, 1, len(d.Spec.Template.Spec.Volumes[0].Projected.Sources))
-	assert.Equal(t, 4, len(d.Spec.Template.Spec.Containers[0].VolumeMounts))
+	assert.Equal(t, 5, len(d.Spec.Template.Spec.Containers[0].VolumeMounts))
+	assert.Equal(t, k8sutil.DefaultServiceAccount, d.Spec.Template.Spec.ServiceAccountName)
 
 	// Deployment should have Ceph labels
 	test.AssertLabelsContainCephRequirements(t, d.ObjectMeta.Labels,

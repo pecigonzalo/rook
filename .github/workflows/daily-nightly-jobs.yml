@@ -2,51 +2,69 @@ name: Daily nightly jobs
 on:
   schedule:
     - cron: "0 0 * * *" # every day at midnight
+  workflow_dispatch: {}
 
 defaults:
   run:
     # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
     shell: bash --noprofile --norc -eo pipefail -x {0}
 
+permissions:
+  contents: read
+
 jobs:
   canary-arm64:
-    runs-on: [self-hosted, ubuntu-20.04, ARM64]
+    runs-on: [self-hosted, ubuntu-20.04-arm64, ARM64]
     if: github.repository == 'rook/rook'
-    env:
-      BLOCK: /dev/sdb
 
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
-      - name: setup golang
-        uses: actions/setup-go@v2
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
         with:
-          go-version: 1.16
+          use-tmate: ${{ secrets.USE_TMATE }}
 
-      - name: teardown minikube and docker
+      - name: setup golang
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version: "1.23"
+
+      - name: Install Docker
         run: |
-          uptime
-          minikube delete
-          docker system prune -a
+          sudo apt-get update
+          sudo apt-get install docker.io -y
+
+      - name: Start Docker service
+        run: sudo service docker start
+
+      - name: Check Docker version
+        run: docker version
 
       - name: setup minikube
         run: |
-          # sudo apt-get install build-essential -y
-          # curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-arm64
-          # sudo install minikube-linux-arm64 /usr/local/bin/minikube
-          # sudo rm -f minikube-linux-arm64
-          # curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/arm64/kubectl"
-          # sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          sudo apt-get install build-essential -y
+          curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-arm64
+          sudo install minikube-linux-arm64 /usr/local/bin/minikube
+          sudo rm -f minikube-linux-arm64
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/arm64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
           minikube start --memory 28g --cpus=12 --driver=docker
+
+      - name: install yq
+        run: |
+          sudo curl -JL https://github.com/mikefarah/yq/releases/download/3.4.1/yq_linux_arm64  --output /usr/bin/yq
+          sudo chmod +x /usr/bin/yq
 
       - name: print k8s cluster status
         run: tests/scripts/github-action-helper.sh print_k8s_cluster_status
 
       - name: use local disk and create partitions for osds
         run: |
+          export BLOCK="/dev/$(tests/scripts/github-action-helper.sh find_extra_block_dev)"
           tests/scripts/github-action-helper.sh use_local_disk
           tests/scripts/create-bluestore-partitions.sh --disk "$BLOCK" --osd-count 1
 
@@ -58,10 +76,11 @@ jobs:
           # Use the official build images for the nightly arm tests instead of rebuilding
           export USE_LOCAL_BUILD=false
           # removing liveness probes since the env is slow and the probe is killing the daemons
-          yq write -d1 -i deploy/examples/cluster-test.yaml "spec.healthCheck.livenessProbe.mon.disabled" true
-          yq write -d1 -i deploy/examples/cluster-test.yaml "spec.healthCheck.livenessProbe.mgr.disabled" true
-          yq write -d1 -i deploy/examples/cluster-test.yaml "spec.healthCheck.livenessProbe.osd.disabled" true
+          yq write -d0 -i deploy/examples/cluster-test.yaml "spec.healthCheck.livenessProbe.mon.disabled" true
+          yq write -d0 -i deploy/examples/cluster-test.yaml "spec.healthCheck.livenessProbe.mgr.disabled" true
+          yq write -d0 -i deploy/examples/cluster-test.yaml "spec.healthCheck.livenessProbe.osd.disabled" true
           tests/scripts/github-action-helper.sh deploy_cluster
+          tests/scripts/github-action-helper.sh deploy_all_additional_resources_on_cluster
           # there are no package for arm64 nfs-ganesha
           kubectl delete -f deploy/examples/nfs-test.yaml
 
@@ -71,42 +90,51 @@ jobs:
       - name: wait for ceph to be ready
         run: tests/scripts/github-action-helper.sh wait_for_ceph_to_be_ready "mon,mgr,osd,mds,rgw,rbd_mirror,fs_mirror" 1
 
-      - name: teardown minikube and docker
-        run: |
-          minikube delete
-          docker system prune -a
-
       - name: collect common logs
         if: always()
         uses: ./.github/workflows/collect-logs
         with:
           name: canary-arm64
 
-      - name: upload canary test result
-        uses: actions/upload-artifact@v2
+      - name: teardown minikube, docker and kubectl
         if: always()
-        with:
-          name: canary-arm64
-          path: test
+        run: |
+          uptime
+          minikube delete
+          docker system prune --all --force
+          sudo service docker stop
+          sudo rm -rf  /usr/local/bin/minikube
+          sudo rm -rf /usr/local/bin/kubectl
+          sudo modprobe -r nbd
 
-  smoke-suite-pacific-devel:
-    runs-on: ubuntu-18.04
+      - name: remove /usr/bin/yq
+        if: always()
+        run: sudo rm -rf /usr/bin/yq
+
+  smoke-suite-reef-devel:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
+        with:
+          use-tmate: ${{ secrets.USE_TMATE }}
+
       - name: setup cluster resources
-        uses: ./.github/workflows/integration-test-setup
+        uses: ./.github/workflows/integration-test-config-latest-k8s
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          kubernetes-version: "1.23.0"
+          kubernetes-version: "1.28.4"
 
       - name: TestCephSmokeSuite
         run: |
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION="pacific-devel" go test -v -timeout 1800s -run TestCephSmokeSuite github.com/rook/rook/tests/integration
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION="reef-devel" go test -v -timeout 1800s -run TestCephSmokeSuite github.com/rook/rook/tests/integration
 
       - name: collect common logs
         if: always()
@@ -117,30 +145,36 @@ jobs:
           tests/scripts/collect-logs.sh
 
       - name: Artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: failure()
         with:
-          name: ceph-smoke-suite-pacific-artifact
+          name: ceph-smoke-suite-reef-artifact
           path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-  smoke-suite-quincy-devel:
-    runs-on: ubuntu-18.04
+  smoke-suite-squid-devel:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
+        with:
+          use-tmate: ${{ secrets.USE_TMATE }}
+
       - name: setup cluster resources
-        uses: ./.github/workflows/integration-test-setup
+        uses: ./.github/workflows/integration-test-config-latest-k8s
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          kubernetes-version: "1.23.0"
+          kubernetes-version: "1.28.4"
 
       - name: TestCephSmokeSuite
         run: |
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION="quincy-devel" go test -v -timeout 1800s -run TestCephSmokeSuite github.com/rook/rook/tests/integration
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION="squid-devel" go test -v -timeout 1800s -run TestCephSmokeSuite github.com/rook/rook/tests/integration
 
       - name: collect common logs
         if: always()
@@ -151,30 +185,36 @@ jobs:
           tests/scripts/collect-logs.sh
 
       - name: Artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: failure()
         with:
-          name: ceph-smoke-suite-quincy-artifact
+          name: ceph-smoke-suite-squid-artifact
           path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-  smoke-suite-ceph-master:
-    runs-on: ubuntu-18.04
+  smoke-suite-ceph-main:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
+        with:
+          use-tmate: ${{ secrets.USE_TMATE }}
+
       - name: setup cluster resources
-        uses: ./.github/workflows/integration-test-setup
+        uses: ./.github/workflows/integration-test-config-latest-k8s
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          kubernetes-version: "1.23.0"
+          kubernetes-version: "1.28.4"
 
       - name: TestCephSmokeSuite
         run: |
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION=master go test -v -timeout 1800s -run TestCephSmokeSuite github.com/rook/rook/tests/integration
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION=main go test -v -timeout 1800s -run TestCephSmokeSuite github.com/rook/rook/tests/integration
 
       - name: collect common logs
         if: always()
@@ -185,30 +225,36 @@ jobs:
           tests/scripts/collect-logs.sh
 
       - name: Artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: failure()
         with:
           name: ceph-smoke-suite-master-artifact
           path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-  object-suite-pacific-devel:
-    runs-on: ubuntu-18.04
+  object-suite-ceph-main:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
+        with:
+          use-tmate: ${{ secrets.USE_TMATE }}
+
       - name: setup cluster resources
-        uses: ./.github/workflows/integration-test-setup
+        uses: ./.github/workflows/integration-test-config-latest-k8s
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          kubernetes-version: "1.23.0"
+          kubernetes-version: "1.28.4"
 
       - name: TestCephObjectSuite
         run: |
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION="pacific-devel" go test -v -timeout 1800s -failfast -run TestCephObjectSuite github.com/rook/rook/tests/integration
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION=main go test -v -timeout 1800s -failfast -run TestCephObjectSuite github.com/rook/rook/tests/integration
 
       - name: collect common logs
         if: always()
@@ -219,64 +265,36 @@ jobs:
           tests/scripts/collect-logs.sh
 
       - name: Artifact
-        uses: actions/upload-artifact@v2
-        if: failure()
-        with:
-          name: ceph-object-suite-pacific-artifact
-          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
-
-  object-suite-master:
-    runs-on: ubuntu-18.04
-    steps:
-      - name: checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-
-      - name: setup cluster resources
-        uses: ./.github/workflows/integration-test-setup
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          kubernetes-version: "1.23.0"
-
-      - name: TestCephObjectSuite
-        run: |
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION=master go test -v -timeout 1800s -failfast -run TestCephObjectSuite github.com/rook/rook/tests/integration
-
-      - name: collect common logs
-        if: always()
-        run: |
-          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
-          export CLUSTER_NAMESPACE="object-ns"
-          export OPERATOR_NAMESPACE="object-ns-system"
-          tests/scripts/collect-logs.sh
-
-      - name: Artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: failure()
         with:
           name: ceph-object-suite-master-artifact
           path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-  upgrade-from-pacific-stable-to-pacific-devel:
-    runs-on: ubuntu-18.04
+  upgrade-from-squid-stable-to-squid-devel:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
+        with:
+          use-tmate: ${{ secrets.USE_TMATE }}
+
       - name: setup cluster resources
-        uses: ./.github/workflows/integration-test-setup
+        uses: ./.github/workflows/integration-test-config-latest-k8s
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          kubernetes-version: "1.23.0"
+          kubernetes-version: "1.28.4"
 
       - name: TestCephUpgradeSuite
         run: |
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-          go test -v -timeout 1800s -failfast -run TestCephUpgradeSuite/TestUpgradeCephToPacificDevel github.com/rook/rook/tests/integration
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          go test -v -timeout 1800s -failfast -run TestCephUpgradeSuite/TestUpgradeCephToSquidDevel github.com/rook/rook/tests/integration
 
       - name: collect common logs
         if: always()
@@ -287,30 +305,37 @@ jobs:
           tests/scripts/collect-logs.sh
 
       - name: Artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: failure()
         with:
-          name: ceph-upgrade-suite-pacific-artifact
+          name: ceph-upgrade-suite-squid-artifact
           path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-  upgrade-from-octopus-stable-to-octopus-devel:
-    runs-on: ubuntu-18.04
+
+  upgrade-from-reef-stable-to-reef-devel:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
     steps:
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
+      - name: consider debugging
+        uses: ./.github/workflows/tmate_debug
+        with:
+          use-tmate: ${{ secrets.USE_TMATE }}
+
       - name: setup cluster resources
-        uses: ./.github/workflows/integration-test-setup
+        uses: ./.github/workflows/integration-test-config-latest-k8s
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          kubernetes-version: "1.23.0"
+          kubernetes-version: "1.28.4"
 
       - name: TestCephUpgradeSuite
         run: |
-          export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-          go test -v -timeout 1800s -failfast -run TestCephUpgradeSuite/TestUpgradeCephToOctopusDevel github.com/rook/rook/tests/integration
+          export DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          go test -v -timeout 1800s -failfast -run TestCephUpgradeSuite/TestUpgradeCephToReefDevel github.com/rook/rook/tests/integration
 
       - name: collect common logs
         if: always()
@@ -321,57 +346,15 @@ jobs:
           tests/scripts/collect-logs.sh
 
       - name: Artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: failure()
         with:
-          name: ceph-upgrade-suite-octopus-artifact
+          name: ceph-upgrade-suite-reef-artifact
           path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-  rgw-multisite-test-with-ceph-devel:
-    runs-on: ubuntu-18.04
-    strategy:
-      matrix:
-        ceph-image-tag: ['latest-master-devel', 'latest-octopus-devel', 'latest-pacific-devel']
-
-    steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: run RGW multisite test
-      uses: ./.github/workflows/rgw-multisite-test
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        ceph-image: quay.io/ceph/daemon-base:${{ matrix.ceph-image-tag }}
-
-    - name: upload test result
-      uses: actions/upload-artifact@v2
-      if: always()
-      with:
-        name: rgw-multisite-testing-ceph-${{ matrix.ceph-image-tag }}
-        path: test
-
-  encryption-pvc-kms-ibm-kp:
-    runs-on: ubuntu-18.04
-    steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: run encryption KMS IBM Key Protect
-      uses: ./.github/workflows/encryption-pvc-kms-ibm-kp
-      if: "env.IBM_KP_SERVICE_INSTANCE_ID != '' && env.IBM_KP_SERVICE_API_KEY != ''"
-      env:
-        IBM_KP_SERVICE_INSTANCE_ID: ${{ secrets.IBM_INSTANCE_ID }}
-        IBM_KP_SERVICE_API_KEY: ${{ secrets.IBM_SERVICE_API_KEY }}
-      with:
-        ibm-instance-id: ${{ secrets.IBM_INSTANCE_ID }}
-        ibm-service-api-key: ${{ secrets.IBM_SERVICE_API_KEY }}
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: upload test result
-      uses: actions/upload-artifact@v2
-      if: always()
-      with:
-        name: encryption-pvc-kms-ibm-kp
-        path: test
+  canary-tests:
+    if: github.repository == 'rook/rook'
+    uses: ./.github/workflows/canary-integration-test.yml
+    with:
+      ceph_images: '["quay.io/ceph/ceph:v18", "quay.io/ceph/ceph:v19", "quay.ceph.io/ceph-ci/ceph:main", "quay.ceph.io/ceph-ci/ceph:reef", "quay.ceph.io/ceph-ci/ceph:squid"]'
+    secrets: inherit
